@@ -13,6 +13,7 @@ import type { BaileysEventEmitter } from '../Types/Events'
 import type { SignalRepositoryWithLIDStore } from '../Types/Signal'
 import { generateSignalPubKey } from '../Utils'
 import type { ILogger } from '../Utils/logger'
+import { createLIDMappingStoreWithSqlite } from '../Utils/multi-db-sqlite/factories'
 import { metrics } from '../Utils/prometheus-metrics.js'
 import { isAnyLidUser, isAnyPnUser, jidDecode, transferDevice, WAJIDDomains } from '../WABinary'
 import type { SenderKeyStore } from './Group/group_cipher'
@@ -112,6 +113,21 @@ export interface IdentitySaveResult {
 export interface LibSignalRepositoryOptions {
 	/** Event emitter for broadcasting identity changes */
 	ev?: BaileysEventEmitter
+	/**
+	 * Optional multi-DB SQLite store. When supplied, the LID mapping
+	 * persistence routes through the typed `jid` + `jid_map` tables in
+	 * `msgstore.db` instead of opaque key-value rows on the shared signal
+	 * key store. All in-memory caching, coalescing, retry, statistics, and
+	 * metrics on top remain identical.
+	 *
+	 * Default (`undefined`): legacy behavior — `auth.keys` carries the
+	 * `'lid-mapping'` rows as before.
+	 *
+	 * Typed as `unknown` here to avoid forcing every importer of
+	 * `LibSignalRepositoryOptions` to resolve the SQLite types. The runtime
+	 * expectation is `MultiDbSqliteStore` from `../Utils/multi-db-sqlite`.
+	 */
+	multiDbStore?: unknown
 }
 
 // ============================================
@@ -322,7 +338,33 @@ export function makeLibSignalRepository(
 		)
 	}
 
-	const lidMapping = new LIDMappingStore(auth.keys as SignalKeyStoreWithTransaction, logger, pnToLIDFunc)
+	// Phase 9.1 integration: if a multi-DB SQLite store was supplied, route
+	// LID mapping persistence through `msgstore.jid_map` (typed) instead of
+	// opaque `'lid-mapping'` rows on the shared key store. The LIDMappingStore
+	// itself is unchanged — its LRU cache, request coalescing, retry,
+	// statistics, and metrics layers all sit on top of the proxied key store.
+	//
+	// The factory is imported statically (not lazily) because this file is
+	// ESM (`"type": "module"` in package.json), so a CommonJS-style
+	// `require()` would throw at runtime. The factory module re-exports only
+	// pure TS symbols — `better-sqlite3` is not actually loaded unless
+	// `createLIDMappingStoreWithSqlite` is reached, and `multiDbStore` is
+	// only present when the caller has already opened a MultiDbSqliteStore
+	// (which is when better-sqlite3 was loaded by the auth-state adapter).
+	let lidMapping: LIDMappingStore
+	if (options?.multiDbStore) {
+		lidMapping = createLIDMappingStoreWithSqlite({
+			innerKeys: auth.keys as SignalKeyStoreWithTransaction,
+			// Boundary cast: public type is `unknown` so consumers of this
+			// module's options don't have a hard dep on the SQLite types.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			store: options.multiDbStore as any,
+			logger,
+			pnToLIDFunc
+		})
+	} else {
+		lidMapping = new LIDMappingStore(auth.keys as SignalKeyStoreWithTransaction, logger, pnToLIDFunc)
+	}
 
 	// Identity key cache to avoid repeated storage reads
 	const identityKeyCache = new LRUCache<string, Uint8Array>({
@@ -405,7 +447,7 @@ export function makeLibSignalRepository(
 	// This prevents PN/LID race conditions where concurrent operations for the
 	// same logical contact acquire different mutex locks because one uses PN
 	// and the other uses LID. (Aligned with WABA behavior — all operations use LID internally.)
-	const resolveCanonicalJid = async(jid: string): Promise<string> => {
+	const resolveCanonicalJid = async (jid: string): Promise<string> => {
 		if (isAnyLidUser(jid)) {
 			return jid
 		}
@@ -541,10 +583,7 @@ export function makeLibSignalRepository(
 							}
 						} catch (error) {
 							// Log but don't fail decryption — identity tracking is best-effort.
-							logger.warn(
-								{ jid, error: (error as Error).message },
-								'Failed to save identity key during decryption'
-							)
+							logger.warn({ jid, error: (error as Error).message }, 'Failed to save identity key during decryption')
 						}
 					}
 				}
@@ -620,26 +659,20 @@ export function makeLibSignalRepository(
 			// Lock per (group, meId) sender-key instead of the synthetic group jid —
 			// concurrent encrypts for different group/meId pairs run in parallel.
 			const senderName = jidToSignalSenderKeyName(group, meId)
-			return parsedKeys.transactWith(
-				{ records: [{ type: 'sender-key', id: senderName.toString() }] },
-				async () => {
-					const { skdm } = await ensureSenderKeyAndCreateSkdm(group, meId)
-					const ciphertext = await new GroupCipher(storage, senderName).encrypt(data)
-					return { ciphertext, senderKeyDistributionMessage: skdm.serialize() }
-				}
-			)
+			return parsedKeys.transactWith({ records: [{ type: 'sender-key', id: senderName.toString() }] }, async () => {
+				const { skdm } = await ensureSenderKeyAndCreateSkdm(group, meId)
+				const ciphertext = await new GroupCipher(storage, senderName).encrypt(data)
+				return { ciphertext, senderKeyDistributionMessage: skdm.serialize() }
+			})
 		},
 
 		async getSenderKeyDistributionMessage({ group, meId }) {
 			// Stage 2: same record-scoped pattern as encryptGroupMessage.
 			const senderName = jidToSignalSenderKeyName(group, meId)
-			return parsedKeys.transactWith(
-				{ records: [{ type: 'sender-key', id: senderName.toString() }] },
-				async () => {
-					const { skdm } = await ensureSenderKeyAndCreateSkdm(group, meId)
-					return skdm.serialize()
-				}
-			)
+			return parsedKeys.transactWith({ records: [{ type: 'sender-key', id: senderName.toString() }] }, async () => {
+				const { skdm } = await ensureSenderKeyAndCreateSkdm(group, meId)
+				return skdm.serialize()
+			})
 		},
 
 		async hasSenderKey({ group, meId }) {
@@ -742,12 +775,9 @@ export function makeLibSignalRepository(
 			// encrypt/decrypt transactions on any of these jids — a delete
 			// can no longer race past an in-flight encrypt that's still
 			// reading the same session.
-			return parsedKeys.transactWith(
-				{ records: sessionAddrs.map(id => ({ type: 'session', id })) },
-				async () => {
-					await auth.keys.set({ session: sessionUpdates })
-				}
-			)
+			return parsedKeys.transactWith({ records: sessionAddrs.map(id => ({ type: 'session', id })) }, async () => {
+				await auth.keys.set({ session: sessionUpdates })
+			})
 		},
 
 		// Release in-memory caches and timers on socket close (adapted from #2191). Uses our own
@@ -1350,8 +1380,7 @@ function signalStorage(
 
 					// Check if keys match
 					const keysMatch =
-						existingKey?.length === identityKey.length &&
-						existingKey.every((byte, i) => byte === identityKey[i])
+						existingKey?.length === identityKey.length && existingKey.every((byte, i) => byte === identityKey[i])
 
 					if (existingKey && !keysMatch) {
 						// IDENTITY KEY CHANGED - contact reinstalled WhatsApp or switched devices

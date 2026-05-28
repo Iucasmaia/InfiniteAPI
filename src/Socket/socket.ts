@@ -441,7 +441,9 @@ export const makeSocket = (config: SocketConfig) => {
 	const { creds } = authState
 	// add transaction capability
 	const keys = addTransactionCapability(authState.keys, logger, transactionOpts)
-	const signalRepository = makeSignalRepository({ creds, keys }, logger, pnFromLIDUSync)
+	const signalRepository = makeSignalRepository({ creds, keys }, logger, pnFromLIDUSync, {
+		multiDbStore: config.multiDbStore
+	})
 
 	// Session activity tracker - tracks last activity for cleanup (must be created first)
 	const sessionActivityTracker = makeSessionActivityTracker(keys, logger)
@@ -1255,13 +1257,16 @@ export const makeSocket = (config: SocketConfig) => {
 		const pairPlatformId = isAndroid ? getPlatformId('Chrome') : getPlatformId(browser[1])
 		const pairPlatformDisplay = isAndroid ? 'Chrome (Mac OS)' : `${browser[1]} (${browser[0]})`
 
-		logger.info({
-			pairCode: pairingCode,
-			jid: authState.creds.me.id,
-			companionPlatformId: pairPlatformId,
-			companionPlatformDisplay: pairPlatformDisplay,
-			isAndroid,
-		}, `pair code requested | companion: ${pairPlatformDisplay} | ${isAndroid ? 'android override -> Chrome' : 'native platform'}`)
+		logger.info(
+			{
+				pairCode: pairingCode,
+				jid: authState.creds.me.id,
+				companionPlatformId: pairPlatformId,
+				companionPlatformDisplay: pairPlatformDisplay,
+				isAndroid
+			},
+			`pair code requested | companion: ${pairPlatformDisplay} | ${isAndroid ? 'android override -> Chrome' : 'native platform'}`
+		)
 
 		ev.emit('creds.update', authState.creds)
 		await sendNode({
@@ -1432,7 +1437,9 @@ export const makeSocket = (config: SocketConfig) => {
 	ws.on('CB:success', async (node: BinaryNode) => {
 		const isAndroid = isAndroidBrowser(browser)
 		const phoneId = authState.creds.me?.id?.split(':')[0]?.split('@')[0] || 'new session'
-		logger.info(`${isAndroid ? '\uD83D\uDCF1' : '\uD83D\uDDA5\uFE0F'} Connected to WA | ${phoneId} | platform: ${isAndroid ? 'SMB_ANDROID' : 'MACOS'} | device: ${isAndroid ? 'Android' : 'Desktop'} | platformType: ${isAndroid ? 'ANDROID_PHONE' : 'CHROME'}`)
+		logger.info(
+			`${isAndroid ? '\uD83D\uDCF1' : '\uD83D\uDDA5\uFE0F'} Connected to WA | ${phoneId} | platform: ${isAndroid ? 'SMB_ANDROID' : 'MACOS'} | device: ${isAndroid ? 'Android' : 'Desktop'} | platformType: ${isAndroid ? 'ANDROID_PHONE' : 'CHROME'}`
+		)
 		clearTimeout(qrTimer) // will never happen in all likelyhood -- but just in case WA sends success on first try
 
 		ev.emit('creds.update', { me: { ...authState.creds.me!, lid: node.attrs.lid } })
