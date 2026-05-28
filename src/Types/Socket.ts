@@ -201,8 +201,42 @@ export type SocketConfig = {
 	makeSignalRepository: (
 		auth: SignalAuthState,
 		logger: ILogger,
-		pnToLIDFunc?: (jids: string[]) => Promise<LIDMapping[] | undefined>
+		pnToLIDFunc?: (jids: string[]) => Promise<LIDMapping[] | undefined>,
+		// `any` here intentionally — the concrete option shape is owned by
+		// `LibSignalRepositoryOptions` in `../Signal/libsignal.ts`, and the
+		// import cycle would bloat the public Types surface. The runtime
+		// makeLibSignalRepository validates the field it actually uses
+		// (`multiDbStore`) — extra fields are ignored.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		options?: any
 	) => SignalRepositoryWithLIDStore
+
+	/**
+	 * Optional multi-DB SQLite store (`MultiDbSqliteStore`).
+	 *
+	 * Currently wired components (phase 9.1):
+	 *   - **LID mapping** — `LIDMappingStore` persists `'lid-mapping'` rows
+	 *     into `msgstore.db.jid_map` (typed) instead of opaque key-value
+	 *     rows on the shared signal key store. Cache, coalescing, retry,
+	 *     and statistics on top of the store are unchanged.
+	 *
+	 * Components with adapters / backends READY but NOT wired here yet
+	 * (the caller passes the adapter explicitly to the matching
+	 * `SocketConfig` slot — `userDevicesCache`, `msgRetryCounterCache`,
+	 * etc.):
+	 *   - User device cache (`UserDeviceCacheSqliteAdapter`)
+	 *   - Retry counter (`MsgRetryCounterSqliteAdapter`)
+	 *   - Bad MAC quarantine (`MessageQuarantineBackend`)
+	 *   - Trusted Contact tokens (`TrustedContactsBackend`)
+	 *   - App-state sync (`AppStateBackend`)
+	 *
+	 * The default (`undefined`) keeps the legacy behavior end-to-end.
+	 *
+	 * Typed as `unknown` to avoid forcing every importer of `SocketConfig`
+	 * to resolve `better-sqlite3` types. The runtime expectation is a
+	 * `MultiDbSqliteStore` instance from `Utils/multi-db-sqlite`.
+	 */
+	multiDbStore?: unknown
 
 	// === Listener Limits (Memory Leak Prevention) ===
 
