@@ -18,6 +18,7 @@ import type {
 	MessageReceiptType,
 	MessageRelayOptions,
 	MessageUserReceipt,
+	NewChatMessageCapInfo,
 	PlaceholderMessageData,
 	SocketConfig,
 	WACallEvent,
@@ -27,8 +28,9 @@ import type {
 	WAMessageKey,
 	WAPatchName
 } from '../Types'
-import { WAMessageStatus, WAMessageStubType } from '../Types'
+import { ReachoutTimelockEnforcementType, WAMessageStatus, WAMessageStubType } from '../Types'
 import {
+	ACCOUNT_RESTRICTED_TEXT,
 	aesDecryptCTR,
 	aesEncryptGCM,
 	cleanMessage,
@@ -98,6 +100,14 @@ import {
 import { extractGroupMetadata } from './groups'
 import { makeMessagesSocket } from './messages-send'
 
+// Set imutável de valores válidos do enum (port de upstream `c89d97b13b`,
+// audit ROBUST-02). Mantido em escopo de módulo pra que múltiplas socket
+// instances compartilhem a mesma estrutura — sem isso, 1k sessões teriam
+// 1k Sets idênticas de 18 strings.
+const ENFORCEMENT_TYPE_VALUES = new Set<string>(Object.values(ReachoutTimelockEnforcementType))
+const isValidEnforcementType = (value: string | undefined): value is ReachoutTimelockEnforcementType =>
+	value !== undefined && ENFORCEMENT_TYPE_VALUES.has(value)
+
 export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	const {
 		logger,
@@ -136,7 +146,9 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		sendPeerDataOperationMessage,
 		messageRetryManager,
 		getPrivacyTokens,
-		registerSocketEndHandler
+		registerSocketEndHandler,
+		// Port de upstream `4dbbba2891` (PR #2442)
+		fetchAccountReachoutTimelock
 	} = sock
 
 	const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
@@ -246,6 +258,15 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	 * (which dedupes issuePrivacyTokens; we dedupe our equivalent getPrivacyTokens path).
 	 */
 	const inFlight463Recoveries = new Set<string>()
+
+	/**
+	 * Dedupe global de `fetchAccountReachoutTimelock` em fire-and-forget.
+	 * Em um burst de 463s (carrossel multi-destinatário, broadcast), sem o
+	 * flag a função seria disparada N vezes em poucos ms — o estado é
+	 * global por socket, basta uma checagem por janela curta. Reseta no
+	 * `.finally()` da própria call. Audit PROTO-01 (RACE-01 mitigation).
+	 */
+	let inFlightReachoutCheck = false
 
 	// Deduplicates retry requests per JID within a short window.
 	// When a burst of Bad MAC errors arrives for the same contact,
@@ -437,6 +458,69 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		return stanzaId
 	}
 
+	// ============================================================
+	// Server-push mex notifications — port de upstream `c89d97b13b`
+	// (PR #2445). Dispatch unificado entre os ops legados de
+	// newsletter (que continuam usando `<mex>` child) e os ops novos
+	// de reachout timelock + message capping (que vêm em `<update>`).
+	// ============================================================
+
+	const handleReachoutTimelockNotification = (data: Record<string, unknown>) => {
+		const payload = data.xwa2_notify_account_reachout_timelock as
+			| { is_active?: boolean; enforcement_type?: string; time_enforcement_ends?: string }
+			| undefined
+
+		if (!payload) {
+			logger.warn('reachout timelock notification missing payload')
+			return
+		}
+
+		if (!payload.is_active) {
+			logger.info('reachout timelock restriction lifted')
+			ev.emit('connection.update', {
+				reachoutTimeLock: {
+					isActive: false,
+					enforcementType: ReachoutTimelockEnforcementType.DEFAULT
+				}
+			})
+			return
+		}
+
+		// NaN guard — servidor pode mandar "abc", "0", "1abc"; sem proteção
+		// caímos em `Invalid Date` ou epoch (1970). Fallback now+60s se o
+		// timestamp for inválido OU ausente (audit SEC-01). WA Web tem o
+		// mesmo default.
+		const tsRaw = payload.time_enforcement_ends
+		const tsParsed = tsRaw && tsRaw !== '0' ? parseInt(tsRaw, 10) : NaN
+		const timeEnforcementEnds =
+			Number.isFinite(tsParsed) && tsParsed > 0 ? new Date(tsParsed * 1000) : new Date(Date.now() + 60_000)
+
+		const enforcementType = isValidEnforcementType(payload.enforcement_type)
+			? payload.enforcement_type
+			: ReachoutTimelockEnforcementType.DEFAULT
+
+		logger.info({ enforcementType, timeEnforcementEnds }, 'reachout timelock restriction set')
+
+		ev.emit('connection.update', {
+			reachoutTimeLock: {
+				isActive: true,
+				timeEnforcementEnds,
+				enforcementType
+			}
+		})
+	}
+
+	const handleMessageCappingNotification = (data: Record<string, unknown>) => {
+		const payload = data.xwa2_notify_new_chat_messages_capping_info_update as NewChatMessageCapInfo | undefined
+		if (!payload) {
+			logger.warn('message capping notification missing payload')
+			return
+		}
+
+		logger.info({ payload }, 'received message capping update')
+		ev.emit('message-capping.update', payload)
+	}
+
 	// Handles mex newsletter notifications
 	const handleMexNewsletterNotification = async (node: BinaryNode) => {
 		const mexNode = getBinaryNodeChild(node, 'mex')
@@ -548,6 +632,47 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				logger.info({ operation, data }, 'Unhandled mex newsletter notification')
 				break
 		}
+	}
+
+	/**
+	 * Dispatcher principal de mex notifications. Trata ops novos (reachout/capping)
+	 * que vêm em `<update op_name=...>` e delega o resto pro handler legado de
+	 * newsletter, que opera com `<mex>` child. Mantém compat com fluxos existentes.
+	 *
+	 * Declarado DEPOIS de `handleMexNewsletterNotification` pra eliminar a
+	 * forward reference que o eslint/no-use-before-define flagaria (audit
+	 * PROTO-02).
+	 */
+	const handleMexNotification = async (node: BinaryNode) => {
+		const updateNode = getBinaryNodeChild(node, 'update')
+		const opName = updateNode?.attrs?.op_name
+
+		if (updateNode && opName === 'NotificationUserReachoutTimelockUpdate') {
+			try {
+				const parsed = JSON.parse(updateNode.content!.toString()) as { data?: Record<string, unknown> }
+				if (parsed?.data) handleReachoutTimelockNotification(parsed.data)
+			} catch (err) {
+				logger.error({ err, opName }, 'failed to parse reachout timelock notification')
+			}
+
+			return
+		}
+
+		if (updateNode && opName === 'MessageCappingInfoNotification') {
+			try {
+				const parsed = JSON.parse(updateNode.content!.toString()) as { data?: Record<string, unknown> }
+				if (parsed?.data) handleMessageCappingNotification(parsed.data)
+			} catch (err) {
+				logger.error({ err, opName }, 'failed to parse message capping notification')
+			}
+
+			return
+		}
+
+		// Demais ops (newsletter) seguem pelo handler legado que já está consolidado
+		// neste fork com normalização do `xwa2_notify_linked_profiles` e do batched
+		// `lid-mapping.update`.
+		await handleMexNewsletterNotification(node)
 	}
 
 	// Handles newsletter notifications
@@ -1979,7 +2104,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				await handleNewsletterNotification(node)
 				break
 			case 'mex':
-				await handleMexNewsletterNotification(node)
+				// Dispatcher unificado (newsletter legacy + reachout/capping novos)
+				await handleMexNotification(node)
 				break
 			case 'w:gp2':
 				await handleGroupNotification(node, child!, result)
@@ -3333,10 +3459,35 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		// error in acknowledgement,
 		// device could not display the message
 		if (attrs.error) {
-			if (attrs.error === SERVER_ERROR_CODES.MissingTcToken) {
+			// O servidor reusa o código 463 para dois cenários:
+			//   (a) MissingTcToken — TC token expirado/ausente pra esse contato (caminho original do fork)
+			//   (b) SenderReachoutTimelocked — conta restrita (port de upstream `4dbbba2891`, PR #2442)
+			// O attrs.error sozinho ('463') não distingue, então:
+			//   - Mantemos o caminho TC token (dedupe + retry single-shot) que já existia
+			//   - Emitimos fetchAccountReachoutTimelock em paralelo (fire-and-forget) — se o
+			//     cenário (b) for o real, o evento `connection.update` carrega o ReachoutTimelockState
+			//   - Marcamos messageStubParameters com ACCOUNT_RESTRICTED_TEXT para o consumer
+			//     conseguir distinguir essa classe de falha
+			const is463 = attrs.error === SERVER_ERROR_CODES.MissingTcToken
+			if (is463) {
 				const msgId = attrs.id
 				const jid = jidNormalizedUser(attrs.from)
 				logTcToken('error_463', { jid, msgId })
+
+				// Fire-and-forget — detecta reachout timelock quando 463 vem por
+				// restrição de conta. Em burst de 463 (carrossel/broadcast) a
+				// flag `inFlightReachoutCheck` evita N queries paralelas; o
+				// `emitUpdate=false` evita double-emit em caso de o push
+				// `NotificationUserReachoutTimelockUpdate` chegar em paralelo
+				// (audit PROTO-01 / RACE-01).
+				if (!inFlightReachoutCheck) {
+					inFlightReachoutCheck = true
+					fetchAccountReachoutTimelock(false)
+						.catch(err => logger.warn({ err: err?.message }, 'failed to fetch reachout timelock on 463'))
+						.finally(() => {
+							inFlightReachoutCheck = false
+						})
+				}
 
 				// WABA Android: error 463 triggers getPrivacyTokens() fire-and-forget
 				// to ensure token is available for the retry below.
@@ -3387,13 +3538,19 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							} else {
 								logger.warn({ jid, msgId }, '463 retry: message not found in store')
 								ev.emit('messages.update', [
-									{ key, update: { status: WAMessageStatus.ERROR, messageStubParameters: ['463'] } }
+									{
+										key,
+										update: { status: WAMessageStatus.ERROR, messageStubParameters: ['463', ACCOUNT_RESTRICTED_TEXT] }
+									}
 								])
 							}
 						} catch (err: any) {
 							logger.warn({ jid, msgId, err: err?.message }, '463 retry failed')
 							ev.emit('messages.update', [
-								{ key, update: { status: WAMessageStatus.ERROR, messageStubParameters: ['463'] } }
+								{
+									key,
+									update: { status: WAMessageStatus.ERROR, messageStubParameters: ['463', ACCOUNT_RESTRICTED_TEXT] }
+								}
 							])
 						}
 					})()
@@ -3430,7 +3587,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 					key,
 					update: {
 						status: WAMessageStatus.ERROR,
-						messageStubParameters: [attrs.error]
+						messageStubParameters: is463 ? [attrs.error, ACCOUNT_RESTRICTED_TEXT] : [attrs.error]
 					}
 				}
 			])
@@ -3483,6 +3640,36 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		identifier: string,
 		exec: (node: BinaryNode) => Promise<void>
 	) => {
+		// Fast-path: ack e descarte de JIDs ignorados antes de enfileirar /
+		// bufferizar — port de upstream `c727b42605` (PR #2352). Para receipts
+		// é LID-aware: quando o nó é nosso e não é grupo, usamos `attrs.recipient`
+		// em vez de `attrs.from` (a outra ponta), evitando filtrar receipts
+		// próprios. Os 3 `shouldIgnoreJid` internos em handleReceipt /
+		// handleNotification / handleMessage são preservados como defesa em
+		// profundidade (o fork tem código sensível depois deles que pressupõe
+		// o JID já filtrado).
+		const from = node.attrs.from
+		let ignoreJid = from
+		// Só aplica a lógica LID-aware pra receipts quando o socket JÁ
+		// autenticou (creds.me populado). Sem creds.me, `areJidsSameUser`
+		// retornaria false → trataríamos receipts próprios como "de outro
+		// JID" e poderíamos descartá-los via shouldIgnoreJid em janelas
+		// raras de reconexão (audit LOSS-02).
+		if (type === 'receipt' && from && authState.creds.me?.id) {
+			const attrs = node.attrs
+			const isLid = attrs.from!.includes('@lid')
+			const isNodeFromMe = areJidsSameUser(
+				attrs.participant || attrs.from,
+				isLid ? authState.creds.me?.lid : authState.creds.me?.id
+			)
+			ignoreJid = !isNodeFromMe || isJidGroup(attrs.from) ? attrs.from : attrs.recipient
+		}
+
+		if (ignoreJid && ignoreJid !== S_WHATSAPP_NET && shouldIgnoreJid(ignoreJid)) {
+			await sendMessageAck(node, type === 'message' ? NACK_REASONS.UnhandledError : undefined)
+			return
+		}
+
 		const isOffline = !!node.attrs.offline
 
 		if (isOffline) {
