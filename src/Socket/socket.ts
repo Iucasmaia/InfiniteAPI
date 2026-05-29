@@ -16,8 +16,8 @@ import {
 } from '../Defaults'
 import { makeSessionActivityTracker } from '../Signal/session-activity-tracker'
 import { makeSessionCleanup } from '../Signal/session-cleanup'
-import type { ConnectionState, LIDMapping, SocketConfig } from '../Types'
-import { DisconnectReason } from '../Types'
+import type { ConnectionState, LIDMapping, NewChatMessageCapInfo, ReachoutTimelockState, SocketConfig } from '../Types'
+import { DisconnectReason, QueryIds, ReachoutTimelockEnforcementType, XWAPaths } from '../Types'
 import {
 	addTransactionCapability,
 	aesEncryptCTR,
@@ -68,6 +68,7 @@ import {
 import { BinaryInfo } from '../WAM/BinaryInfo.js'
 import { USyncQuery, USyncUser } from '../WAUSync/'
 import { WebSocketClient } from './Client'
+import { executeWMexQuery } from './mex'
 
 /**
  * Connects to WA servers and performs:
@@ -1659,6 +1660,65 @@ export const makeSocket = (config: SocketConfig) => {
 		Object.assign(creds, update)
 	})
 
+	/**
+	 * Fetches your account's standing when it comes to restrictions.
+	 * Port de upstream `4dbbba2891` (PR #2442).
+	 *
+	 * @param emitUpdate — quando `true` (default), emite `connection.update`
+	 *   com o `ReachoutTimelockState` resultante. Quando `false`, apenas
+	 *   retorna — usado pelo caminho fire-and-forget no handler de 463 pra
+	 *   evitar double-emit com o push notification `NotificationUser-
+	 *   ReachoutTimelockUpdate` que chega em paralelo (audit SEC #475 RACE-01).
+	 * @returns Returns the state of the restrictions.
+	 */
+	const fetchAccountReachoutTimelock = async (emitUpdate = true): Promise<ReachoutTimelockState> => {
+		// 10s timeout — fire-and-forget chamadores não podem ficar com
+		// promise pendente indefinida em caso de socket instável (audit
+		// ROBUST-01).
+		const queryResult = await promiseTimeout<{
+			is_active?: boolean
+			time_enforcement_ends?: string
+			enforcement_type: ReachoutTimelockEnforcementType
+		}>(10_000, (resolve, reject) =>
+			executeWMexQuery<{
+				is_active?: boolean
+				time_enforcement_ends?: string
+				enforcement_type: ReachoutTimelockEnforcementType
+			}>({}, QueryIds.REACHOUT_TIMELOCK, XWAPaths.xwa2_fetch_account_reachout_timelock, query, generateMessageTag)
+				.then(resolve)
+				.catch(reject)
+		)
+		// NaN guard — servidor pode mandar "abc", "0", "1abc"; sem proteção
+		// caímos em `Invalid Date` ou `new Date(0)` (audit SEC-01).
+		const tsRaw = queryResult?.time_enforcement_ends
+		const tsParsed = tsRaw && tsRaw !== '0' ? parseInt(tsRaw, 10) : NaN
+		const result: ReachoutTimelockState = {
+			isActive: !!queryResult?.is_active,
+			timeEnforcementEnds: Number.isFinite(tsParsed) && tsParsed > 0 ? new Date(tsParsed * 1000) : undefined,
+			enforcementType: queryResult?.enforcement_type ?? ReachoutTimelockEnforcementType.DEFAULT
+		}
+		if (emitUpdate) {
+			ev.emit('connection.update', { reachoutTimeLock: result })
+		}
+
+		return result
+	}
+
+	/**
+	 * Fetches your account's new chat limits.
+	 * Port de upstream `4dbbba2891` (PR #2442).
+	 * @returns Returns the quota and the usage.
+	 */
+	const fetchNewChatMessageCap = async (): Promise<NewChatMessageCapInfo> => {
+		return executeWMexQuery<NewChatMessageCapInfo>(
+			{ input: { type: 'INDIVIDUAL_NEW_CHAT_MSG' } },
+			QueryIds.MESSAGE_CAPPING_INFO,
+			XWAPaths.xwa2_message_capping_info,
+			query,
+			generateMessageTag
+		)
+	}
+
 	return {
 		type: 'md' as 'md',
 		ws,
@@ -1691,6 +1751,9 @@ export const makeSocket = (config: SocketConfig) => {
 		sendWAMBuffer,
 		executeUSyncQuery,
 		onWhatsApp,
+		// Port de upstream `4dbbba2891` (PR #2442) — reachout timelock + new chat message cap
+		fetchAccountReachoutTimelock,
+		fetchNewChatMessageCap,
 		// Unified Session Telemetry
 		/** Send unified_session telemetry manually */
 		sendUnifiedSession,
