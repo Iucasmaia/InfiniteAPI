@@ -276,6 +276,15 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	let tcTokenIndexSaveTimer: ReturnType<typeof setTimeout> | undefined
 	let lastTcTokenPruneTs = 0
 
+	/**
+	 * Audit memory-leak Finding 6 — timers de cleanup do PDO (8s) eram criados
+	 * com `setTimeout(...)` sem rastreio. Em disconnect com PDOs in-flight, o
+	 * timer disparava sobre cache fechado e retinha closures (stanzaId,
+	 * placeholderResendCache, logger) por até 8s. Rastreamento permite
+	 * cancelamento síncrono no `registerSocketEndHandler`.
+	 */
+	const pdoCleanupTimers = new Set<ReturnType<typeof setTimeout>>()
+
 	// Load persisted JID index and last prune timestamp on startup
 	const tcTokenIndexLoaded = (async () => {
 		try {
@@ -447,13 +456,17 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		// Clean up message ID marker after storing with stanzaId
 		await placeholderResendCache.del(resendId)
 
-		// Cleanup timeout: if no response after 8s, assume phone is offline
-		setTimeout(async () => {
+		// Cleanup timeout: if no response after 8s, assume phone is offline.
+		// Audit memory-leak Finding 6 — timer agora rastreado em `pdoCleanupTimers`
+		// pra que `registerSocketEndHandler` cancele todos os pendentes no disconnect.
+		const cleanupTimer: ReturnType<typeof setTimeout> = setTimeout(async () => {
+			pdoCleanupTimers.delete(cleanupTimer)
 			if (await placeholderResendCache.get<PlaceholderMessageData | boolean>(stanzaId)) {
 				logger.debug({ stanzaId }, 'PDO message without response after 8 seconds. Phone possibly offline')
 				await placeholderResendCache.del(stanzaId)
 			}
 		}, 8_000)
+		pdoCleanupTimers.add(cleanupTimer)
 
 		return stanzaId
 	}
@@ -3829,6 +3842,43 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 		identityAssertDebounce.close?.()
 		identityAssertDebounce.flushAll?.()
+
+		// Audit memory-leak Finding 8: o cleanup do `placeholderResendCache`
+		// JÁ acontece em chats.ts:1631-1640 (que roda DEPOIS deste handler
+		// na cadeia de close). chats.ts:138-140 faz back-assign
+		// `config.placeholderResendCache = placeholderResendCache` quando o
+		// consumer não supre, então uma guarda `!config.placeholderResendCache`
+		// aqui seria sempre false — código morto. Cobertura é total via
+		// chats.ts; nada a fazer aqui (review Copilot #476).
+
+		// Audit memory-leak Finding 1+9 — limpa Sets de dedup/in-flight pra
+		// soltar suas closures imediatamente em vez de esperar expiração
+		// natural dos timers internos (5s/60s).
+		//
+		// NÃO limpar `tcTokenKnownJids` aqui: o handler de `connection.update`
+		// em :3772 agenda um flush assíncrono via `tcTokenIndexLoaded.then(...)`
+		// que serializa `[...tcTokenKnownJids]` pro auth state. Limpar
+		// síncrono aqui faria o spread capturar Set vazio antes do `then`
+		// rodar, persistindo índice vazio (review Codex P2 #476).
+		// O conteúdo de `tcTokenKnownJids` é solto naturalmente pelo GC
+		// quando o socket for descartado.
+		tcTokenRetriedMsgIds.clear()
+		inFlight463Recoveries.clear()
+		retryRequestActiveJids.clear()
+		identityInFlightRefreshes.clear()
+		// `tcTokenIndexSaveTimer` é cancelado pelo handler de connection.update
+		// (:3774) ANTES de agendar o flush final; aqui só limpamos defensivamente
+		// caso a sequência de eventos seja invertida em algum caminho de erro.
+		if (tcTokenIndexSaveTimer) {
+			clearTimeout(tcTokenIndexSaveTimer)
+			tcTokenIndexSaveTimer = undefined
+		}
+
+		// Audit memory-leak Finding 6 — cancela qualquer cleanup PDO ainda
+		// pendente (até 8s). Sem isso, o timer disparava sobre o cache
+		// fechado e retinha as closures até resolver.
+		for (const t of pdoCleanupTimers) clearTimeout(t)
+		pdoCleanupTimers.clear()
 	})
 
 	return {
