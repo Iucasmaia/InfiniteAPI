@@ -1774,8 +1774,21 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				return
 			}
 
+			// CodeRabbit guard (PR #487 review): `getBinaryNodeChild` is typed to
+			// return `BinaryNode | undefined` and `attrs.value` is itself optional.
+			// The previous `countChild!.attrs.value!` would throw a `TypeError` if
+			// the server ever sent a PreKeyLow notification without `<count>` (or
+			// without a value attr). In production WAWeb always includes both, but
+			// guarding here avoids a socket-tearing crash if the protocol ever
+			// drifts. Skips quietly with a warn since it's harmless to ignore.
 			const countChild = getBinaryNodeChild(node, 'count')
-			const count = +countChild!.attrs.value!
+			const countValue = countChild?.attrs?.value
+			if (!countValue) {
+				logger.warn({ node }, 'PreKeyLow notification missing count child or value attr, skipping')
+				return
+			}
+
+			const count = +countValue
 			const shouldUploadMorePreKeys = count < MIN_PREKEY_COUNT
 
 			logger.debug({ count, shouldUploadMorePreKeys }, 'recv pre-key count')
