@@ -14,6 +14,7 @@
  */
 
 import { LRUCache } from 'lru-cache'
+import type { ILogger } from './logger.js'
 import { metrics } from './prometheus-metrics.js'
 
 /**
@@ -519,6 +520,66 @@ export function clearGlobalCaches(): void {
 	}
 
 	globalCaches.clear()
+}
+
+/**
+ * Minimal NodeCache-like surface used by {@link safeCacheSet}. Typed loosely
+ * so any `@cacheable/node-cache`-compatible adapter satisfies it without
+ * forcing the concrete type on every callsite.
+ */
+export type NodeCacheSetLike<V> = {
+	set: (key: string, value: V, ttl?: number) => unknown | Promise<unknown>
+}
+
+const NODE_CACHE_FULL_TOKENS = ['max keys', 'ECACHEFULL']
+
+const isNodeCacheFullError = (err: unknown): boolean => {
+	const msg = (err as Error)?.message ?? ''
+	return NODE_CACHE_FULL_TOKENS.some(t => msg.includes(t))
+}
+
+/**
+ * Safe wrapper around `@cacheable/node-cache` `NodeCache.set()` for advisory
+ * caches with a configured `maxKeys` limit.
+ *
+ * Background — `@cacheable/node-cache` v2.x diverges from the classic
+ * `node-cache`: when `maxKeys` is reached, `.set()` THROWS
+ * `"Cache max keys amount exceeded"` (or `ECACHEFULL` in some paths)
+ * instead of silently evicting an entry. See dist/cacheable-node-cache.cjs
+ * line 278 in v2.0.1.
+ *
+ * Most cache writes in this codebase are advisory — durable correctness is
+ * held by SQLite / auth state / recomputation. Dropping a write when the
+ * cache is full is preferable to crashing the caller and tearing down the
+ * socket. This helper centralizes that swallowing pattern so each callsite
+ * doesn't repeat the try/catch boilerplate (audit BOT-001-B).
+ *
+ * Any error that is NOT the maxKeys/ECACHEFULL exception is rethrown
+ * unchanged — only the cache-saturation case is swallowed.
+ *
+ * @param cache the NodeCache-like instance
+ * @param key cache key
+ * @param value value to store
+ * @param logger optional logger (debug entry on saturation)
+ * @param context optional label included in the debug log so multiple
+ *                callsites sharing a logger can be told apart
+ */
+export async function safeCacheSet<V>(
+	cache: NodeCacheSetLike<V>,
+	key: string,
+	value: V,
+	logger?: ILogger,
+	context?: string
+): Promise<void> {
+	try {
+		await cache.set(key, value)
+	} catch (err) {
+		if (!isNodeCacheFullError(err)) {
+			throw err
+		}
+
+		logger?.debug({ key, context }, 'cache full, skipping write (durable store unaffected)')
+	}
 }
 
 export default Cache
