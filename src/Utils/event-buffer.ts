@@ -574,6 +574,27 @@ export const makeEventBuffer = (
 	function cleanupHistoryCache(): void {
 		if (historyCache.size > config.maxHistoryCacheSize) {
 			const removed = historyCache.cleanup(config.lruCleanupRatio)
+			// Audit BOT-002 (cubic review #480) — REVERTIDO: o bloco
+			// `for (const key of removed) delete data.historySets.*` causava
+			// perda de dados.
+			//
+			// Fluxo do flush():
+			//   1. cleanupHistoryCache() é chamado AQUI (linha 688)
+			//   2. consolidateEvents(data) lê data.historySets.* (linha 730)
+			//   3. data = newData                                  (linha 738)
+			//   4. ev.emit('event', consolidatedData)              (linha 740)
+			//
+			// Se deletássemos entradas de data.historySets aqui, mensagens
+			// evictadas pelo LRU desapareceriam ANTES do consolidateEvents
+			// → messaging-history.set seria emitido SEM essas mensagens.
+			// E o `data = newData` no passo 3 já zera o buffer inteiro após
+			// emit, então deletar individual aqui não libera memória
+			// duradoura — só causa perda de dados.
+			//
+			// O `historyCache.cleanup()` acima continua sendo chamado pra
+			// cap do dedup tracker (necessário pra dedup entre batches).
+			// Os dados em data.historySets seguem até o flush emitir e
+			// trocar pra newData — comportamento original e correto.
 			stats.lruCleanups++
 			logger.debug(
 				{

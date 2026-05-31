@@ -5,6 +5,7 @@ import { randomBytes } from 'crypto'
 import Long from 'long'
 import { proto } from '../../WAProto/index.js'
 import {
+	DEFAULT_CACHE_MAX_KEYS,
 	DEFAULT_CACHE_TTLS,
 	DEFAULT_SESSION_CLEANUP_CONFIG,
 	KEY_BUNDLE_TYPE,
@@ -156,24 +157,31 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	/** this mutex ensures that each retryRequest will wait for the previous one to finish */
 	const retryMutex = makeMutex()
 
+	// Audit MEM-B3 — `maxKeys` previne crescimento ilimitado sob retry storm
+	// (msgRetryCache com TTL 1h) e em paths que poucos consumers fornecem
+	// cache custom. LRU eviction de entries velhas é equivalente ao expiry
+	// natural pro caso de retry tardio. Valores em sync com DEFAULT_CACHE_MAX_KEYS.
 	const msgRetryCache =
 		config.msgRetryCounterCache ||
 		new NodeCache<number>({
 			stdTTL: DEFAULT_CACHE_TTLS.MSG_RETRY, // 1 hour
-			useClones: false
+			useClones: false,
+			maxKeys: DEFAULT_CACHE_MAX_KEYS.MSG_RETRY
 		})
 	const callOfferCache =
 		config.callOfferCache ||
 		new NodeCache<WACallEvent>({
 			stdTTL: DEFAULT_CACHE_TTLS.CALL_OFFER, // 5 mins
-			useClones: false
+			useClones: false,
+			maxKeys: DEFAULT_CACHE_MAX_KEYS.CALL_OFFER
 		})
 
 	const placeholderResendCache =
 		config.placeholderResendCache ||
 		new NodeCache({
 			stdTTL: DEFAULT_CACHE_TTLS.MSG_RETRY, // 1 hour
-			useClones: false
+			useClones: false,
+			maxKeys: DEFAULT_CACHE_MAX_KEYS.PLACEHOLDER_RESEND
 		})
 
 	/**
@@ -226,7 +234,16 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	}
 
 	// Debounce identity-change session refreshes per JID to avoid bursts
-	const identityAssertDebounce = new NodeCache<boolean>({ stdTTL: 5, useClones: false })
+	// Audit IDENTITY-CACHE — TTL 5s + uso esporádico mantém o cap baixo na
+	// prática. Cap defensivo de 1000 (= ~200 identity asserts/s sustentados,
+	// muito acima do realista). `NodeCache.set()` LANÇA ao atingir maxKeys,
+	// então identity-change-handler.ts:219 envolve em try/catch silencioso
+	// (mesmo padrão de BOT-001 em auth-utils.ts).
+	const identityAssertDebounce = new NodeCache<boolean>({
+		stdTTL: 5,
+		useClones: false,
+		maxKeys: 1000
+	})
 
 	// Stage 3 (upstream #2573 M11): in-flight Set for identity refreshes.
 	// Created ONCE per socket lifetime so handleIdentityChange can dedup
@@ -2935,6 +2952,31 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 						return
 					}
 
+					// Audit RETRY-A2 — sender-key stale em skmsg de grupo: o counter
+					// avançou no remetente mas a chain local não acompanhou. Reenviar
+					// o mesmo skmsg via sendRetryRequest sempre falha (mesma sender-key,
+					// mesmo counter). O loop só para quando msgRetryManager bate o cap
+					// (~5 retries × ~20s = ~100s de loop por mensagem). NACK 496
+					// (SignalErrorOldCounter) sinaliza ao servidor que a mensagem é
+					// irrecuperável; o próximo SKDM do remetente resincroniza a chain.
+					// Guard `enc.type === 'skmsg'` isola só grupos — pkmsg/msg (DMs,
+					// onde vivem carrossel/botões/listas) seguem o caminho padrão.
+					const stubError = msg?.messageStubParameters?.[0] || ''
+					const isOldCounterErr =
+						stubError.includes('old counter') || stubError.includes('Over 2000 messages into the future')
+					if (isOldCounterErr) {
+						const encChild = getBinaryNodeChild(node, 'enc')
+						if (encChild?.attrs?.type === 'skmsg') {
+							logger.warn(
+								{ msgId: msg.key?.id, remoteJid: msg.key?.remoteJid, error: stubError },
+								'skmsg sender-key stale: NACK 496 to stop retry loop (waiting for fresh SKDM)'
+							)
+							await sendMessageAck(node, NACK_REASONS.SignalErrorOldCounter)
+							acked = true
+							return
+						}
+					}
+
 					// Handle "Message absent from node" - likely a CTWA (Click-to-WhatsApp) ads message
 					// These messages are only encrypted for the primary phone, not linked devices
 					// We need to request the message content from the phone via PDO (Peer Data Operation)
@@ -3522,8 +3564,11 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							})
 							logTcToken('fetched', { jid, reason: 'error_463' })
 						})
-						.catch(() => {
-							/* fire-and-forget */
+						.catch(err => {
+							// Audit SILENT-002 — antes silenciado; agora `debug` pra dar
+							// visibilidade quando 463 recovery falhar sistematicamente
+							// (próximas mensagens pro mesmo JID podem falhar).
+							logger.debug({ jid, err: err?.message }, '463 recovery: tctoken fetch/store failed')
 						})
 						.finally(() => {
 							inFlight463Recoveries.delete(jid)
@@ -3588,8 +3633,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 						})
 						logTcToken('fetched', { jid: jid479, reason: 'error_479' })
 					})
-					.catch(() => {
-						/* fire-and-forget */
+					.catch(err => {
+						// Audit SILENT-002 — antes silenciado; agora `debug` pra
+						// dar visibilidade em falhas sistemáticas de 479 recovery.
+						logger.debug({ jid: jid479, err: err?.message }, '479 recovery: tctoken fetch/store failed')
 					})
 			} else {
 				logger.warn({ attrs }, 'received error in ack')

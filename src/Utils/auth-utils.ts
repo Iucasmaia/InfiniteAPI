@@ -3,7 +3,7 @@ import { Boom } from '@hapi/boom'
 import { AsyncLocalStorage } from 'async_hooks'
 import { Mutex } from 'async-mutex'
 import { randomBytes } from 'crypto'
-import { DEFAULT_CACHE_TTLS } from '../Defaults'
+import { DEFAULT_CACHE_MAX_KEYS, DEFAULT_CACHE_TTLS } from '../Defaults'
 import type {
 	AuthenticationCreds,
 	CacheStore,
@@ -108,7 +108,15 @@ export function makeCacheableSignalKeyStore(
 		new NodeCache<SignalDataTypeMap[keyof SignalDataTypeMap]>({
 			stdTTL: DEFAULT_CACHE_TTLS.SIGNAL_STORE, // 5 minutes
 			useClones: false,
-			deleteOnExpire: true
+			deleteOnExpire: true,
+			// Audit memory MEM-006 — sem `maxKeys`, NodeCache aceita entries
+			// ilimitadas até o TTL (5min) expirar. Em history sync inicial
+			// com milhares de chaves Signal (pre-keys, sessions, sender-keys),
+			// o cache cresce livremente durante a janela e fragmenta o V8
+			// heap — RSS pós-sync não retorna ao baseline. `maxKeys: 10_000`
+			// é consistente com `DEFAULT_CACHE_MAX_KEYS.SIGNAL_STORE` usado
+			// nos LRUCache equivalentes do fork.
+			maxKeys: DEFAULT_CACHE_MAX_KEYS.SIGNAL_STORE
 		})
 
 	// Mutex for protecting cache operations
@@ -116,6 +124,32 @@ export function makeCacheableSignalKeyStore(
 
 	function getUniqueId(type: string, id: string) {
 		return `${type}.${id}`
+	}
+
+	/**
+	 * Audit BOT-001 — `@cacheable/node-cache` default export (`NodeCache`,
+	 * versão síncrona) LANÇA `Cache max keys amount exceeded` (linha 278 do
+	 * dist) quando `store.size >= maxKeys`. NÃO é eviction LRU como o
+	 * `lru-cache` v11. Sem este wrapper, o throw propaga pra dentro do
+	 * caller de `signalStore.get()`/`set()` mesmo o durable store já ter
+	 * persistido com sucesso — Signal interpreta como falha de read/write
+	 * e mensagens param de ser entregues em sessões com >10k Signal keys
+	 * distintas dentro da janela de TTL (history sync inicial de conta
+	 * business). Tornar o cache write best-effort: durable store é a
+	 * fonte de verdade; cache miss no próximo read recupera natural.
+	 */
+	async function safeCacheSet(key: string, value: SignalDataTypeMap[keyof SignalDataTypeMap]) {
+		try {
+			await cache.set(key, value)
+		} catch (err) {
+			const msg = (err as Error)?.message ?? ''
+			if (msg.includes('max keys') || msg.includes('ECACHEFULL')) {
+				logger?.debug({ key }, 'signal cache full, skipping cache write (durable store unaffected)')
+				return
+			}
+
+			throw err
+		}
 	}
 
 	return {
@@ -150,7 +184,7 @@ export function makeCacheableSignalKeyStore(
 						if (item !== null && item !== undefined) {
 							data[id] = item
 							// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
-							await cache.set(getUniqueId(type, id), item as SignalDataTypeMap[keyof SignalDataTypeMap])
+							await safeCacheSet(getUniqueId(type, id), item as SignalDataTypeMap[keyof SignalDataTypeMap])
 						}
 					}
 				}
@@ -185,7 +219,7 @@ export function makeCacheableSignalKeyStore(
 						if (value === null || value === undefined) {
 							await cache.del(getUniqueId(type, id))
 						} else {
-							await cache.set(getUniqueId(type, id), value)
+							await safeCacheSet(getUniqueId(type, id), value)
 						}
 
 						keys += 1
