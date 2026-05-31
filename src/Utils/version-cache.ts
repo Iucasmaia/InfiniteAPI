@@ -123,6 +123,11 @@ async function fetchVersionOnce(cacheFilePath: string, logger?: VersionCacheLogg
 	// bloqueavam tentativas de refetch, prendendo todos os sockets em versão
 	// estática. Agora o fallback é retornado mas não persiste — próxima
 	// chamada tenta o online de novo.
+	// LOG-001 fix (PR #487 review): split the post-fetch log into two
+	// branches so the message reflects what actually happened. The previous
+	// unconditional `'Version fetched and cached'` logged "cached" even in
+	// the fallback path (which is explicitly NOT cached, per Finding 10),
+	// misleading anyone reading prod logs.
 	if (result.isLatest) {
 		memoryCache = entry
 		// Audit Finding 10 — `writeCacheFile` já loga internamente via
@@ -130,11 +135,10 @@ async function fetchVersionOnce(cacheFilePath: string, logger?: VersionCacheLogg
 		// code (review #476). `void` documenta a intenção fire-and-forget
 		// sem o `no-floating-promises` lint warning.
 		void writeCacheFile(cacheFilePath, entry, logger)
+		logger?.info({ version: entry.version, source: entry.source }, 'Version fetched and cached')
 	} else {
-		logger?.debug({ version: entry.version }, 'using bundled fallback version (not caching)')
+		logger?.info({ version: entry.version, source: entry.source }, 'using bundled fallback version (not cached)')
 	}
-
-	logger?.info({ version: entry.version, source: entry.source }, 'Version fetched and cached')
 
 	return entry
 }
