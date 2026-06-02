@@ -515,7 +515,13 @@ export const encryptedStream = async (
 	}
 }
 
-const DEF_HOST = 'mmg.whatsapp.net'
+/**
+ * Default WhatsApp media CDN host. Upstream #2432 renamed `DEF_HOST` to
+ * `DEF_MEDIA_HOST` and exported it so per-socket callers can use it as a
+ * baseline fallback when the server hasn't published an explicit host yet.
+ */
+export const DEF_MEDIA_HOST = 'mmg.whatsapp.net'
+
 const AES_CHUNK_SIZE = 16
 
 const toSmallestChunkSize = (num: number) => {
@@ -526,17 +532,79 @@ export type MediaDownloadOptions = {
 	startByte?: number
 	endByte?: number
 	options?: RequestInit
+	/**
+	 * Optional media host override (Upstream #2432). Falls back to
+	 * `DEF_MEDIA_HOST` when the caller doesn't pass one — preserves the
+	 * historical default behavior for every consumer that hasn't migrated
+	 * to passing a per-socket host yet.
+	 */
+	host?: string
 }
 
-export const getUrlFromDirectPath = (directPath: string) => `https://${DEF_HOST}${directPath}`
+export const getUrlFromDirectPath = (directPath: string, host: string = DEF_MEDIA_HOST) =>
+	`https://${host}${directPath}`
+
+/**
+ * SSRF allowlist (PR #490 review — Codex P1 / Copilot P1 / Cubic P2):
+ *
+ * The `url` field on a `DownloadableMessage` is the proto field populated by
+ * the message SENDER. Treating an arbitrary host parsed from that field as
+ * trusted enables a sender-controlled SSRF: send a message with
+ * `url='https://attacker.example/track'` + `directPath='/v/t62...'`, and our
+ * client would fetch `https://attacker.example/v/t62...`, leaking the
+ * recipient's IP and the directPath (and exposing internal network reach
+ * on any environment where ${ATTACKER} resolves to a private range).
+ *
+ * Restrict the host derived from `url` to the WhatsApp media CDN family —
+ * any subdomain of `whatsapp.net`. CDN regional balancers (`mmg-fna.whatsapp.net`,
+ * `media-gru1-1.cdn.whatsapp.net`, etc) still match; arbitrary attacker hosts
+ * do not. Explicit `opts.host` from the caller bypasses this check because
+ * callers are trusted (they decide what host to use).
+ */
+const WHATSAPP_HOST_SUFFIX = /(^|\.)whatsapp\.net$/i
+
+/**
+ * Best-effort parse of the hostname from a media URL. Used by
+ * `downloadContentFromMessage` as a fallback when `opts.host` isn't
+ * provided but the proto carried a full `url`. Silently returns undefined
+ * for malformed inputs (the caller decides what to do).
+ *
+ * Returns `hostname` (not `host`) so URLs with explicit ports
+ * (`https://mmg.whatsapp.net:443/...`) collapse to the bare hostname —
+ * `getUrlFromDirectPath` re-applies the canonical `https://` scheme and an
+ * embedded port would produce malformed URLs.
+ */
+const extractHost = (url: string | null | undefined): string | undefined => {
+	if (!url) return undefined
+	try {
+		return new URL(url).hostname
+	} catch {
+		return undefined
+	}
+}
 
 export const downloadContentFromMessage = async (
 	{ mediaKey, directPath, url }: DownloadableMessage,
 	type: MediaType,
 	opts: MediaDownloadOptions = {}
 ) => {
-	const isValidMediaUrl = url?.startsWith('https://mmg.whatsapp.net/')
-	const downloadUrl = isValidMediaUrl ? url : getUrlFromDirectPath(directPath!)
+	// Upstream #2432 fallback chain: explicit `opts.host` > host parsed from
+	// the proto's `url` > `DEF_MEDIA_HOST`. Honors a non-default CDN host
+	// (e.g. regional balancer) carried in the proto without forcing every
+	// caller to thread it through.
+	//
+	// PR #490 review: gate the host parsed from `url` (sender-controlled)
+	// behind a `*.whatsapp.net` allowlist to block SSRF. Explicit `opts.host`
+	// is trusted because callers chose it themselves.
+	let fallbackHost: string | undefined = opts.host
+	if (!fallbackHost) {
+		const parsed = extractHost(url)
+		if (parsed && WHATSAPP_HOST_SUFFIX.test(parsed)) {
+			fallbackHost = parsed
+		}
+	}
+
+	const downloadUrl = directPath ? getUrlFromDirectPath(directPath, fallbackHost) : url
 	if (!downloadUrl) {
 		throw new Boom('No valid media URL or directPath present in message', { statusCode: 400 })
 	}
