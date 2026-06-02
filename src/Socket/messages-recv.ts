@@ -59,6 +59,7 @@ import {
 	normalizeKeyLidToPn,
 	normalizeMessageJids,
 	resolveLidToPn,
+	safeCacheSet,
 	SERVER_ERROR_CODES,
 	toNumber,
 	unixTimestampSeconds,
@@ -228,7 +229,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		return retryLocks.withLock(retryLockRef(msgId, participant), async () => {
 			const key = `${msgId}:${participant}`
 			const next = ((await msgRetryCache.get<number>(key)) ?? 0) + 1
-			await msgRetryCache.set(key, next)
+			// BOT-001-B: wrap NodeCache.set so a maxKeys saturation degrades
+			// gracefully (debug-logged) instead of propagating up into the
+			// retry handler and tripping `onUnexpectedError` / socket teardown.
+			await safeCacheSet(msgRetryCache, key, next, logger, 'msgRetryCache')
 			return next
 		})
 	}
@@ -424,6 +428,15 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		// Stage 9 (upstream #2579): collapse the previous `get → set` cache-
 		// dedupe into one per-id critical section so two concurrent callers
 		// can't both observe an empty cache and both fire the resend.
+		//
+		// PR #490 review (Cubic P1): track whether the marker was actually
+		// persisted. `safeCacheSet` swallows maxKeys saturation, so if the
+		// cache is full the marker write becomes a no-op — and the post-delay
+		// `'RESOLVED'` check (which infers "message arrived during the delay"
+		// from cache miss) would incorrectly drop the resend silently. When
+		// the marker write fails, we still need to proceed with the PDO send
+		// and skip the early-return branch entirely.
+		let markerWritten = false
 		const alreadyHandled = await placeholderResendLocks.withLock(
 			{ namespace: '__placeholder_resend__', id: resendId },
 			async () => {
@@ -433,8 +446,23 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 					return true
 				}
 
-				// Temporarily mark as requested using message ID to prevent race conditions
-				await placeholderResendCache.set(resendId, true)
+				// Temporarily mark as requested using message ID to prevent race conditions.
+				// BOT-001-B: maxKeys saturation falls back to debug log instead of throwing.
+				try {
+					await placeholderResendCache.set(resendId, true)
+					markerWritten = true
+				} catch (err) {
+					const msg = (err as Error)?.message ?? ''
+					if (!msg.includes('max keys') && !msg.includes('ECACHEFULL')) {
+						throw err
+					}
+
+					logger.debug(
+						{ resendId },
+						'placeholderResendCache full, marker skipped (will still send PDO unconditionally)'
+					)
+				}
+
 				return false
 			}
 		)
@@ -442,8 +470,12 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 		await delay(2000)
 
-		// Check if message was received during delay
-		if (!(await placeholderResendCache.get<PlaceholderMessageData | boolean>(resendId))) {
+		// Check if message was received during delay.
+		// PR #490 review (Cubic P1): only trust the cache-miss → 'RESOLVED' inference
+		// when we actually persisted the marker. If markerWritten=false the cache miss
+		// reflects "we never wrote it" (cache was full), NOT "message arrived during delay"
+		// — skip the early return and let the PDO go out unconditionally.
+		if (markerWritten && !(await placeholderResendCache.get<PlaceholderMessageData | boolean>(resendId))) {
 			logger.debug({ messageKey }, 'message received while resend requested')
 			return 'RESOLVED'
 		}
@@ -461,9 +493,12 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		const stanzaId = await sendPeerDataOperationMessage(pdoMessage)
 
 		// CRITICAL FIX: Store metadata using stanzaId (not messageKey.id)
-		// The PDO response will use stanzaId to identify which request it's responding to
+		// The PDO response will use stanzaId to identify which request it's responding to.
+		// BOT-001-B: safeCacheSet swallows maxKeys saturation — losing this entry only
+		// means the eventual PDO response won't find its metadata, which is recoverable
+		// (downstream code already handles missing cache entries).
 		if (msgData && stanzaId) {
-			await placeholderResendCache.set(stanzaId, msgData)
+			await safeCacheSet(placeholderResendCache, stanzaId, msgData, logger, 'placeholderResendCache')
 			logger.debug(
 				{ messageKey: messageKey.id, stanzaId },
 				'CTWA: Cached metadata using stanzaId for PDO response lookup'
@@ -678,22 +713,37 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		const opName = updateNode?.attrs?.op_name
 
 		if (updateNode && opName === 'NotificationUserReachoutTimelockUpdate') {
-			try {
-				const parsed = JSON.parse(updateNode.content!.toString()) as { data?: Record<string, unknown> }
-				if (parsed?.data) handleReachoutTimelockNotification(parsed.data)
-			} catch (err) {
-				logger.error({ err, opName }, 'failed to parse reachout timelock notification')
+			// NULL-001 fix (PR #487 review): guard explicit `null/undefined content`
+			// up-front instead of relying on the non-null assertion and the outer
+			// catch. The try/catch already mitigated the TypeError, but skipping
+			// the parse for a bodyless <update> avoids the noise log entry.
+			if (!updateNode.content) {
+				logger.debug({ opName }, 'reachout timelock notification has no content, skipping')
+			} else {
+				try {
+					const parsed = JSON.parse(updateNode.content.toString()) as { data?: Record<string, unknown> }
+					if (parsed?.data) handleReachoutTimelockNotification(parsed.data)
+				} catch (err) {
+					logger.error({ err, opName }, 'failed to parse reachout timelock notification')
+				}
 			}
 
 			return
 		}
 
 		if (updateNode && opName === 'MessageCappingInfoNotification') {
-			try {
-				const parsed = JSON.parse(updateNode.content!.toString()) as { data?: Record<string, unknown> }
-				if (parsed?.data) handleMessageCappingNotification(parsed.data)
-			} catch (err) {
-				logger.error({ err, opName }, 'failed to parse message capping notification')
+			// NULL-001 fix (PR #487 review): same guard as the reachout-timelock
+			// branch above — explicit null/undefined check on content avoids the
+			// non-null assertion and the TypeError-as-log noise.
+			if (!updateNode.content) {
+				logger.debug({ opName }, 'message capping notification has no content, skipping')
+			} else {
+				try {
+					const parsed = JSON.parse(updateNode.content.toString()) as { data?: Record<string, unknown> }
+					if (parsed?.data) handleMessageCappingNotification(parsed.data)
+				} catch (err) {
+					logger.error({ err, opName }, 'failed to parse message capping notification')
+				}
 			}
 
 			return
@@ -1568,7 +1618,20 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			// `(msgId, participant)` ref.
 			await retryLocks.withLock(retryLockRef(msgId, String(msgKey?.participant)), async () => {
 				const key = `${msgId}:${msgKey?.participant}`
-				await msgRetryCache.set(key, attempt.count)
+				// BOT-001-B: maxKeys saturation degrades to a debug log. Losing this
+				// mirror only means the in-memory retry count diverges from the
+				// durable one for this key until the next successful write — the
+				// retry loop is bounded by `maxMsgRetryCount` either way.
+				//
+				// PR #490 review (Cubic P1 acceptable): yes, a saturated
+				// `msgRetryCache` (10k entries × TTL 1h) could in theory let the
+				// retry counter stall and exceed `maxMsgRetryCount` for that
+				// key. The alternative — throwing to the receive handler — would
+				// tear down message processing for ALL keys, not just one. We
+				// accept the bounded over-retry as the lesser evil; if it does
+				// happen, the `autoCleanCorrupted` path still handles the
+				// corrupted session independently.
+				await safeCacheSet(msgRetryCache, key, attempt.count, logger, 'msgRetryCache')
 			})
 		} else {
 			// Fallback to old system
@@ -1596,7 +1659,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			}
 
 			retryCount += 1
-			await msgRetryCache.set(key, retryCount)
+			// BOT-001-B: same rationale as the new-system branch above.
+			await safeCacheSet(msgRetryCache, key, retryCount, logger, 'msgRetryCache')
 			recordMessageRetry('retry')
 		}
 
@@ -1746,8 +1810,21 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				return
 			}
 
+			// CodeRabbit guard (PR #487 review): `getBinaryNodeChild` is typed to
+			// return `BinaryNode | undefined` and `attrs.value` is itself optional.
+			// The previous `countChild!.attrs.value!` would throw a `TypeError` if
+			// the server ever sent a PreKeyLow notification without `<count>` (or
+			// without a value attr). In production WAWeb always includes both, but
+			// guarding here avoids a socket-tearing crash if the protocol ever
+			// drifts. Skips quietly with a warn since it's harmless to ignore.
 			const countChild = getBinaryNodeChild(node, 'count')
-			const count = +countChild!.attrs.value!
+			const countValue = countChild?.attrs?.value
+			if (!countValue) {
+				logger.warn({ node }, 'PreKeyLow notification missing count child or value attr, skipping')
+				return
+			}
+
+			const count = +countValue
 			const shouldUploadMorePreKeys = count < MIN_PREKEY_COUNT
 
 			logger.debug({ count, shouldUploadMorePreKeys }, 'recv pre-key count')
@@ -3405,7 +3482,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 					call.linkCreatorPn = linkInfo.attrs.link_creator_pn
 				}
 
-				await callOfferCache.set(call.id, call)
+				// BOT-001-B: safeCacheSet swallows maxKeys saturation. Losing this
+				// offer entry only affects subsequent reject/accept correlation for
+				// the same call.id — at worst the call event is emitted standalone.
+				await safeCacheSet(callOfferCache, call.id, call, logger, 'callOfferCache')
 			}
 
 			// Extract call link data from group_update
