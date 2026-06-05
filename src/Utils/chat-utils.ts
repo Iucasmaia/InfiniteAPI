@@ -471,6 +471,17 @@ export const extractSyncdPatches = async (result: BinaryNode, options: RequestIn
 	return final
 }
 
+/**
+ * Download an app-state external blob (sync attachment).
+ *
+ * PR #493 review P2-002 — note on `opts.host`:
+ * The proto `IExternalBlobReference` carries the WhatsApp-CDN-signed `url`
+ * field directly from the server (with `?ccb=&oh=&oe=&_nc_sid=` query
+ * params). `downloadContentFromMessage` prefers that signed URL verbatim
+ * (post-P1-001 fix), so the per-socket `mediaHost` has NO effect on this
+ * code path. Intentionally not threading `opts.host` here — it would be
+ * dead code: the URL branch is always selected for app-state blobs.
+ */
 export const downloadExternalBlob = async (blob: proto.IExternalBlobReference, options: RequestInit) => {
 	const stream = await downloadContentFromMessage(blob, 'md-app-state', { options })
 	const bufferArray: Buffer[] = []
