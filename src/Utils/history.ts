@@ -23,6 +23,14 @@ const inflatePromise = promisify(inflate)
 /**
  * Downloads and decompresses history sync data from WhatsApp servers.
  *
+ * PR #493 review P2-002 — note on `opts.host`:
+ * The proto `IHistorySyncNotification` carries the WhatsApp-CDN-signed `url`
+ * field directly from the server (with `?ccb=&oh=&oe=&_nc_sid=` query
+ * params). `downloadContentFromMessage` prefers that signed URL verbatim
+ * (post-P1-001 fix), so the per-socket `mediaHost` has NO effect on this
+ * code path. Intentionally not threading `opts.host` here — it would be
+ * dead code: the URL branch is always selected for history sync blobs.
+ *
  * @param msg - The history sync notification message containing download info
  * @param options - Request options for the download
  * @returns Decoded HistorySync protocol buffer

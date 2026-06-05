@@ -2240,7 +2240,22 @@ type DownloadMediaMessageContext = {
 const REUPLOAD_REQUIRED_STATUS = [410, 404]
 
 /**
- * Downloads the given message. Throws an error if it's not a media message
+ * Downloads the given message. Throws an error if it's not a media message.
+ *
+ * PR #493 review P2-002 — note on `options.host`:
+ * `MediaDownloadOptions.host` (per-socket CDN host introduced in upstream
+ * #2432) is passed through to `downloadContentFromMessage` verbatim. When
+ * the message's proto carries a WhatsApp-CDN-signed `url`, that URL is
+ * used as-is (post-P1-001 fix) and `options.host` is ignored. When only
+ * `directPath` is present, `options.host` controls the CDN host used to
+ * build the URL.
+ *
+ * Consumers who want this socket's CDN host should pass:
+ * ```ts
+ * await downloadMediaMessage(msg, 'buffer', { host: sock.getMediaHost() }, ctx)
+ * ```
+ *
+ * Omitting `options.host` falls back to `DEF_MEDIA_HOST` ("mmg.whatsapp.net").
  */
 export const downloadMediaMessage = async <Type extends 'buffer' | 'stream'>(
 	message: WAMessage,
