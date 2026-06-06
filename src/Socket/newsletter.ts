@@ -50,7 +50,10 @@ const parseNewsletterMetadata = (result: unknown): NewsletterMetadata | null => 
 	//   2. For preview-only responses (e.g. fetching a non-followed
 	//      channel via invite), `thread_metadata.picture` is absent and
 	//      the server returns `image` / `preview` siblings instead, so
-	//      reading `.picture` alone returned undefined.
+	//      reading `.picture` alone returned undefined. The siblings have
+	//      been observed at TWO different shapes — sometimes inside
+	//      `thread_metadata.{image,preview}` and sometimes alongside it
+	//      at `node.{image,preview}`. Both are tolerated below.
 	//
 	// Fix: unwrap the `result` envelope if present, require a string `id`,
 	// and translate fields into the flat shape with the documented
@@ -68,7 +71,7 @@ const parseNewsletterMetadata = (result: unknown): NewsletterMetadata | null => 
 
 	const thread = node.thread_metadata ?? {}
 	const viewer = node.viewer_metadata ?? {}
-	const pic = thread.picture ?? thread.image ?? thread.preview
+	const pic = thread.picture ?? thread.image ?? thread.preview ?? node.image ?? node.preview
 
 	return {
 		id: node.id,
