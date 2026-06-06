@@ -10,7 +10,13 @@ import { join } from 'path'
 import { Readable, Transform } from 'stream'
 import { URL } from 'url'
 import { proto } from '../../WAProto/index.js'
-import { DEFAULT_ORIGIN, MEDIA_HKDF_KEY_MAPPING, MEDIA_PATH_MAP, type MediaType } from '../Defaults'
+import {
+	DEFAULT_ORIGIN,
+	MEDIA_HKDF_KEY_MAPPING,
+	MEDIA_PATH_MAP,
+	NEWSLETTER_MEDIA_PATH_MAP,
+	type MediaType
+} from '../Defaults'
 import type {
 	BaileysEventMap,
 	DownloadableMessage,
@@ -619,6 +625,7 @@ export const downloadContentFromMessage = async (
 		downloadUrl = getUrlFromDirectPath(directPath, opts.host)
 	}
 
+
 	if (!downloadUrl) {
 		throw new Boom('No valid media URL or directPath present in message', { statusCode: 400 })
 	}
@@ -909,7 +916,7 @@ export const getWAUploadToServer = (
 	{ customUploadHosts, fetchAgent, logger, options }: SocketConfig,
 	refreshMediaConn: (force: boolean) => Promise<MediaConnInfo>
 ): WAMediaUploadFunction => {
-	return async (filePath, { mediaType, fileEncSha256B64, timeoutMs }) => {
+	return async (filePath, { mediaType, fileEncSha256B64, timeoutMs, newsletter }) => {
 		// send a query JSON to obtain the url & auth token to upload our media
 		let uploadInfo = await refreshMediaConn(false)
 
@@ -931,11 +938,51 @@ export const getWAUploadToServer = (
 			Origin: DEFAULT_ORIGIN
 		}
 
+		const pathMap = newsletter ? NEWSLETTER_MEDIA_PATH_MAP : MEDIA_PATH_MAP
+		const pathSegment = pathMap[mediaType]
+		// Use explicit `=== undefined` rather than falsy check: some valid map
+		// entries are empty strings (e.g. `md-app-state: ''`). Treating those
+		// as "missing path" would throw an unintended error for callers that
+		// hit those flows.
+		if (pathSegment === undefined) {
+			throw new Error(
+				`No upload path configured for mediaType=${mediaType}` +
+					(newsletter ? ' in NEWSLETTER_MEDIA_PATH_MAP' : ' in MEDIA_PATH_MAP')
+			)
+		}
+
 		for (const { hostname } of hosts) {
 			logger.debug(`uploading to "${hostname}"`)
 
 			const auth = encodeURIComponent(uploadInfo.auth)
-			const url = `https://${hostname}${MEDIA_PATH_MAP[mediaType]}/${fileEncSha256B64}?auth=${auth}&token=${fileEncSha256B64}`
+			let url = `https://${hostname}${pathSegment}/${fileEncSha256B64}?auth=${auth}&token=${fileEncSha256B64}`
+
+			// Newsletter upload hints, mirroring upstream PR #2434.
+			//
+			// Empirically grounded against WA Web 2.3000.x JS source on
+			// 2026-06-05 — both literals are present in chunk MEhTUFr43MH.js:
+			//
+			//   server_thumb_gen: (c?.server_thumb_gen) != null ? "1" : void 0
+			//   server_transcode: m === "newsletter-video" &&
+			//                     o("WAWebABProps").getABPropConfigVa(...)
+			//
+			// In the official client, `server_thumb_gen=1` is gated on a per-
+			// upload config and `server_transcode=1` is gated on an A/B test
+			// firing only for `newsletter-video`. In our 5-minute CDP capture
+			// neither toggle was set, so the official traffic did not include
+			// either param — and the upload still succeeded. The server treats
+			// both as hints, so always sending them is the safe default and
+			// matches the behavior @alesdi documented on PR #2434.
+			//
+			// We send `server_transcode=1` for video / gif / ptv (slightly
+			// broader than the JS literal, which only mentions newsletter-video)
+			// to preserve parity with the upstream PR.
+			if (newsletter) {
+				url += '&server_thumb_gen=1'
+				if (mediaType === 'video' || mediaType === 'gif' || mediaType === 'ptv') {
+					url += '&server_transcode=1'
+				}
+			}
 
 			let result: MediaUploadResult | undefined
 			try {
