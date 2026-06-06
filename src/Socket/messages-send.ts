@@ -2,7 +2,7 @@ import NodeCache from '@cacheable/node-cache'
 import { Boom } from '@hapi/boom'
 import { randomBytes } from 'crypto'
 import { proto } from '../../WAProto/index.js'
-import { DEFAULT_CACHE_TTLS, WA_DEFAULT_EPHEMERAL } from '../Defaults'
+import { DEFAULT_CACHE_TTLS, URL_REGEX, WA_DEFAULT_EPHEMERAL } from '../Defaults'
 import type {
 	AlbumMediaItem,
 	AlbumMediaResult,
@@ -66,6 +66,7 @@ import {
 	isHostedPnUser,
 	isJidBot,
 	isJidGroup,
+	isJidNewsletter,
 	isLidUser,
 	isPnUser,
 	jidDecode,
@@ -81,6 +82,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	const {
 		logger,
 		linkPreviewImageThumbnailWidth,
+		autoImageFromLinkInNewsletter,
 		generateHighQualityLinkPreview,
 		options: httpRequestOptions,
 		patchMessageBeforeSending,
@@ -104,6 +106,91 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		groupToggleEphemeral,
 		registerSocketEndHandler
 	} = sock
+
+	/**
+	 * Newsletter (channel) link upgrade.
+	 *
+	 * When the destination is a newsletter and the caller is sending plain
+	 * text containing a URL, upgrade the message to an `imageMessage` with
+	 * the URL's og:image as media and the original text as caption. This
+	 * matches how news outlets (g1 in our reference capture) post articles
+	 * in channels: full-resolution image + caption with title and URL.
+	 *
+	 * Without this upgrade, channels show the raw URL with no preview at
+	 * all — the official mobile client never auto-generates one for posts
+	 * in channels, so any preview a Baileys caller produces is the only
+	 * preview that exists.
+	 *
+	 * Best-effort: if og:image is missing, unreachable, or times out, the
+	 * original text content is returned unchanged so the send still goes
+	 * out as text. Non-newsletter JIDs and non-text content always return
+	 * the original.
+	 *
+	 * Security note (residual risk, accepted): `getUrlInfo` fetches the
+	 * page to extract og:image, and the upload step later fetches the
+	 * og:image URL itself. Both reuse the same fetch path Baileys uses
+	 * everywhere else, so no NEW SSRF surface is introduced — but the
+	 * 3s timeout, opt-in flag, and the fact that only newsletter owners
+	 * can trigger this make the residual risk acceptable for the feature.
+	 * Hosts that need strict egress filtering should set
+	 * `autoImageFromLinkInNewsletter: false` and produce their own image
+	 * messages upstream of `sendMessage`.
+	 */
+	const tryUpgradeNewsletterLinkToImage = async (
+		jid: string,
+		content: AnyMessageContent
+	): Promise<AnyMessageContent> => {
+		if (autoImageFromLinkInNewsletter === false) return content
+		if (!isJidNewsletter(jid)) return content
+		// Only act on a bare `{ text }`. If caller is already sending image,
+		// video, document, etc. — respect their intent.
+		if (typeof content !== 'object' || content === null) return content
+		const text = (content as { text?: string }).text
+		if (typeof text !== 'string' || text.length === 0) return content
+		// Stricter than checking known media keys: any non-text field
+		// (mentions, contextInfo, linkPreview: false, edit, quoted, etc.)
+		// signals the caller has intent beyond a bare text + URL post.
+		// Refuse to silently drop those by upgrading. The newsletter
+		// broadcast nature means mentions and replies aren't meaningful
+		// in practice, but respecting the input shape avoids surprise
+		// regressions for callers that pass extra fields.
+		const hasExtraFields = Object.keys(content).some(k => k !== 'text')
+		if (hasExtraFields) return content
+
+		// Find the first URL in the text.
+		URL_REGEX.lastIndex = 0
+		const match = URL_REGEX.exec(text)
+		if (!match) return content
+		const url = match[0]
+
+		try {
+			const info = await getUrlInfo(url, {
+				thumbnailWidth: linkPreviewImageThumbnailWidth,
+				fetchOpts: {
+					timeout: 3_000,
+					...(httpRequestOptions || {})
+				},
+				logger
+			})
+			const ogImage = info?.originalThumbnailUrl
+			if (!ogImage) return content
+
+			logger?.debug(
+				{ jid, url, ogImage },
+				'newsletter link upgrade: posting as imageMessage with og:image'
+			)
+			return {
+				image: { url: ogImage },
+				caption: text
+			} as AnyMessageContent
+		} catch (err: any) {
+			logger?.debug(
+				{ jid, url, err: err?.message },
+				'newsletter link upgrade: og:image fetch failed, falling back to text'
+			)
+			return content
+		}
+	}
 
 	const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
 
@@ -1117,9 +1204,23 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			if (isNewsletter) {
 				const patched = patchMessageBeforeSending ? await patchMessageBeforeSending(message, []) : message
 				const bytes = encodeNewsletterMessage(patched as proto.IMessage)
+				// `mediatype` on the plaintext node lets the channel server
+				// route the message to the right media CDN bucket. Without
+				// it, media-bearing newsletter messages can be ACK'd 479 and
+				// drop silently for subscribers. The attribute mirrors the
+				// `mediatype` set on `enc` for non-newsletter encrypted sends.
+				// PTV note: `getMediaType` returns '' for `ptvMessage`. Without a
+			// fallback, a newsletter PTV send would land without the
+			// `mediatype` attribute and the server may ACK it 479. Detect
+			// PTV directly so the plaintext node carries `mediatype="ptv"`.
+			const plaintextMediaType =
+				mediaType || ((patched as proto.IMessage | undefined)?.ptvMessage ? 'ptv' : '')
+			const plaintextAttrs: BinaryNodeAttributes = plaintextMediaType
+				? { mediatype: plaintextMediaType }
+				: {}
 				binaryNodeContent.push({
 					tag: 'plaintext',
-					attrs: {},
+					attrs: plaintextAttrs,
 					content: bytes
 				})
 				const stanza: BinaryNode = {
@@ -2704,6 +2805,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 			const userJid = authState.creds.me!.id
 
+			// Best-effort upgrade: plain text + URL → imageMessage + caption
+			// when destination is a newsletter (no-op for other JIDs).
+			// We thread this through `effectiveContent` rather than reassigning
+			// `content`, so TypeScript can still narrow the original union for
+			// the `disappearingMessagesInChat` / `delete` branches below.
+			const effectiveContent: AnyMessageContent = await tryUpgradeNewsletterLinkToImage(jid, content)
+
 			if (
 				typeof content === 'object' &&
 				'disappearingMessagesInChat' in content &&
@@ -2719,7 +2827,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						: disappearingMessagesInChat
 				await groupToggleEphemeral(jid, value)
 			} else {
-				const fullMsg = await generateWAMessage(jid, content, {
+				const fullMsg = await generateWAMessage(jid, effectiveContent, {
 					logger,
 					userJid,
 					getUrlInfo: text =>
