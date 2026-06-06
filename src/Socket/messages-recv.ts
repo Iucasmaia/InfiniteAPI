@@ -448,6 +448,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 				// Temporarily mark as requested using message ID to prevent race conditions.
 				// BOT-001-B: maxKeys saturation falls back to debug log instead of throwing.
+				// PR #490 Cubic P1 fix: track markerWritten explicitly so the post-delay
+				// `'RESOLVED'` branch only fires when we genuinely persisted the marker —
+				// `safeCacheSet`'s silent swallow would otherwise be indistinguishable from
+				// the legitimate "message arrived during the delay" cache miss.
 				try {
 					await placeholderResendCache.set(resendId, true)
 					markerWritten = true

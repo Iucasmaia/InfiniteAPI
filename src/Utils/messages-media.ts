@@ -594,23 +594,38 @@ export const downloadContentFromMessage = async (
 	type: MediaType,
 	opts: MediaDownloadOptions = {}
 ) => {
-	// Upstream #2432 fallback chain: explicit `opts.host` > host parsed from
-	// the proto's `url` > `DEF_MEDIA_HOST`. Honors a non-default CDN host
-	// (e.g. regional balancer) carried in the proto without forcing every
-	// caller to thread it through.
+	// PR #493 review P1-001 fix — restore the pre-port preference for the
+	// proto's `url` when it is a WhatsApp CDN URL. Server-issued URLs for
+	// `IExternalBlobReference` (app state) and `IHistorySyncNotification`
+	// (history sync) carry SIGNED query params (`?ccb=&oh=&oe=&_nc_sid=`)
+	// that `getUrlFromDirectPath` cannot reconstruct from `directPath`
+	// alone — dropping them causes the CDN to return HTTP 403 on those
+	// signed-URL paths.
 	//
-	// PR #490 review: gate the host parsed from `url` (sender-controlled)
-	// behind a `*.whatsapp.net` allowlist to block SSRF. Explicit `opts.host`
-	// is trusted because callers chose it themselves.
-	let fallbackHost: string | undefined = opts.host
-	if (!fallbackHost) {
-		const parsed = extractHost(url)
-		if (parsed && WHATSAPP_HOST_SUFFIX.test(parsed)) {
-			fallbackHost = parsed
-		}
+	// SSRF gate (PR #490): only trust `url` when its hostname matches the
+	// `*.whatsapp.net` allowlist. Sender-controlled hostnames outside the
+	// allowlist are still rejected (the old behavior `startsWith('https://mmg.whatsapp.net/')`
+	// was stricter — this allowlist accepts regional balancers like
+	// `mmg-fna.whatsapp.net` and `media-gru1-1.cdn.whatsapp.net` too).
+	const urlHost = extractHost(url)
+	const isTrustedWhatsappUrl = !!url && !!urlHost && WHATSAPP_HOST_SUFFIX.test(urlHost)
+
+	let downloadUrl: string | undefined
+	if (isTrustedWhatsappUrl) {
+		// Preserve the server-signed URL verbatim — query params included.
+		downloadUrl = url
+	} else if (directPath) {
+		// Fallback: build the URL from `directPath`. Honor `opts.host` if a
+		// caller passed one (trusted); otherwise `getUrlFromDirectPath`
+		// defaults to `DEF_MEDIA_HOST`. The sender-controlled host parsed
+		// from `url` is NOT used here as a fallback — that was a separate
+		// upstream #2432 path that we deliberately drop in favor of the
+		// signed-URL preservation above (the two are mutually exclusive:
+		// either we have a trusted full URL, or we build one from scratch).
+		downloadUrl = getUrlFromDirectPath(directPath, opts.host)
 	}
 
-	const downloadUrl = directPath ? getUrlFromDirectPath(directPath, fallbackHost) : url
+
 	if (!downloadUrl) {
 		throw new Boom('No valid media URL or directPath present in message', { statusCode: 400 })
 	}
