@@ -19,7 +19,70 @@ import {
 import { compactError } from './error-log-utils'
 import { unpadRandomMax16 } from './generics'
 import type { ILogger } from './logger'
+import {
+	cacheMessageSecretIfPresent,
+	decryptMsmsgBotMessage,
+	extractMsmsgStanzaInfo,
+	type MsmsgSecretCache,
+	OrphanMsmsgError
+} from './meta-ai-msmsg'
 import { retry, RetryExhaustedError, type RetryOptions } from './retry-utils'
+
+/**
+ * Re-used sentinel for the msgBuffer initializer when the e2e type is `msmsg`
+ * (which decodes via decryptMsmsgBotMessage and bypasses the generic
+ * `proto.Message.decode(msgBuffer)` path entirely). Avoids `noUnusedLocals` /
+ * `used-before-assignment` warnings without paying a per-call alloc.
+ */
+const EMPTY_UINT8_ARRAY = new Uint8Array(0)
+
+/**
+ * Extracted to keep the inline e2e-type switch under the `max-depth: 4` lint
+ * rule. The msmsg branch otherwise needs an extra `if (e2eType === 'msmsg')`
+ * level inside the existing `try { switch { case '...' } }` block, pushing the
+ * sender-key-distribution `if/try` further down to depth 5.
+ *
+ * Note on `lidToPn`: WAWebLidMigrationUtils.toPn is sync in WA Web (looks up
+ * an in-memory map). Our LIDMappingStore.getPNForLID is async, so we can't
+ * call it from this sync block without restructuring the wider decrypt flow.
+ * Empirically the Meta AI "oi" capture is 1:1 (no participant in the cache
+ * key) — group bot chats are the only case that needs LID→PN, and they fall
+ * back to using the raw LID as the participant component. If group bot
+ * support is needed later, pass a pre-resolved sync mapper here.
+ */
+const decodeIncomingMsmsg = (args: {
+	content: Uint8Array
+	msmsgCache: MsmsgSecretCache | undefined
+	msmsgInfo: ReturnType<typeof extractMsmsgStanzaInfo>
+	fullMessage: WAMessage
+	stanza: BinaryNode
+	author: string
+	sender: string
+	meLid: string
+	meId: string
+	logger: ILogger
+}): proto.IMessage => {
+	const { content, msmsgCache, msmsgInfo, fullMessage, stanza, author, sender, meLid, meId, logger } = args
+	if (!msmsgCache) {
+		throw new Error('Meta AI msmsg received but no MsmsgSecretCache was wired into decryptMessageNode')
+	}
+	if (!msmsgInfo) {
+		throw new Error('msmsg enc without companion <meta target_id> node')
+	}
+	return decryptMsmsgBotMessage({
+		ciphertext: content,
+		stanzaInfo: msmsgInfo,
+		stanzaId: fullMessage.key.id || stanza.attrs.id || '',
+		authorJid: author,
+		chatJid: sender,
+		isGroup: isJidGroup(sender) ?? false,
+		isFbidBot: isJidMetaAI(author) ?? false,
+		meLid,
+		meId,
+		cache: msmsgCache,
+		logger
+	})
+}
 
 export const getDecryptionJid = async (sender: string, repository: SignalRepositoryWithLIDStore): Promise<string> => {
 	if (isLidUser(sender) || isHostedLidUser(sender)) {
@@ -336,9 +399,25 @@ export const decryptMessageNode = (
 	meId: string,
 	meLid: string,
 	repository: SignalRepositoryWithLIDStore,
-	logger: ILogger
+	logger: ILogger,
+	/**
+	 * Optional per-socket cache of (cacheKey → messageSecret) used to decrypt
+	 * `<enc type="msmsg">` (Meta AI / FBID bot replies). Caller (Socket layer)
+	 * supplies one instance per connection. When absent and an msmsg stanza
+	 * does arrive, `decodeIncomingMsmsg` throws a dedicated `Error('Meta AI
+	 * msmsg received but no MsmsgSecretCache was wired into decryptMessageNode')`
+	 * — not the generic "Unknown e2e type" path — so misconfiguration surfaces
+	 * with a precise message rather than being silently NACKed.
+	 */
+	msmsgCache?: MsmsgSecretCache
 ) => {
 	const { fullMessage, author, sender } = decodeMessageNode(stanza, meId, meLid)
+
+	// Pre-scan for msmsg metadata children (<meta target_id>, <bot edit>, etc.).
+	// extractMsmsgStanzaInfo returns null unless an enc child with type=msmsg
+	// is present, so this is a no-op for ordinary pkmsg/skmsg stanzas.
+	const msmsgInfo = extractMsmsgStanzaInfo(stanza)
+
 	return {
 		fullMessage,
 		category: stanza.attrs.category,
@@ -373,7 +452,10 @@ export const decryptMessageNode = (
 
 					decryptables += 1
 
-					let msgBuffer: Uint8Array
+					// Initialized for skmsg/pkmsg/msg/plaintext paths. The msmsg path
+					// short-circuits the generic decode by setting msg directly below,
+					// so msgBuffer stays at this sentinel-empty value.
+					let msgBuffer: Uint8Array = EMPTY_UINT8_ARRAY
 
 					const decryptionJid = await getDecryptionJid(author, repository)
 
@@ -429,14 +511,38 @@ export const decryptMessageNode = (
 							case 'plaintext':
 								msgBuffer = content
 								break
+							case 'msmsg':
+								// msmsg is decoded INSIDE decryptMsmsgBotMessage (it returns an
+								// already-decoded IMessage), so leave msgBuffer alone and short-
+								// circuit the generic decode path below.
+								break
 							default:
 								throw new Error(`Unknown e2e type: ${e2eType}`)
 						}
 
-						let msg: proto.IMessage = proto.Message.decode(
-							e2eType !== 'plaintext' ? unpadRandomMax16(msgBuffer) : msgBuffer
-						)
+						let msg: proto.IMessage =
+							e2eType === 'msmsg'
+								? decodeIncomingMsmsg({
+										content,
+										msmsgCache,
+										msmsgInfo,
+										fullMessage,
+										stanza,
+										author,
+										sender,
+										meLid,
+										meId,
+										logger
+									})
+								: proto.Message.decode(e2eType !== 'plaintext' ? unpadRandomMax16(msgBuffer) : msgBuffer)
 						msg = msg.deviceSentMessage?.message || msg
+
+						// Cache `messageContextInfo.messageSecret` so subsequent msmsg replies
+						// referencing this message's id can find the decryption secret. Mirrors
+						// WA Web's flow where every decoded msg has its secret stashed in
+						// `WAWebMsmsgMsgSecretCache`.
+						cacheMessageSecretIfPresent(msmsgCache, msg, fullMessage.key, logger)
+
 						if (msg.senderKeyDistributionMessage) {
 							//eslint-disable-next-line max-depth
 							try {
@@ -461,6 +567,7 @@ export const decryptMessageNode = (
 
 						const isCorrupted = isCorruptedSessionError(originalError)
 						const isSessionRecord = isSessionRecordError(originalError)
+						const isOrphanMsmsg = originalError instanceof OrphanMsmsgError
 
 						// Compact context for the COMMON case (corrupted-session +
 						// no-session-record). Keeps a one-liner per failure instead of the
@@ -477,6 +584,7 @@ export const decryptMessageNode = (
 							decryptionJid,
 							isSessionRecordError: isSessionRecord,
 							isCorruptedSession: isCorrupted,
+							isOrphanMsmsg,
 							...(isRetryExhausted && { retriesExhausted: true, attempts: err.attempts })
 						}
 
@@ -507,6 +615,24 @@ export const decryptMessageNode = (
 							// Session record errors are transient and the internal retry
 							// loop already exhausted its retries before reaching here.
 							logger.warn(compactContext, `no session record after ${err.attempts} attempts, will resync`)
+						} else if (isOrphanMsmsg) {
+							// Meta AI / FBID bot reply arrived but we never saw the outgoing
+							// message that carried `messageContextInfo.messageSecret`. Common
+							// when sending the prompt single-device (no deviceSentMessage
+							// echo to feed the cache) — emit at debug since the user will
+							// retry the prompt naturally and the next reply will succeed if
+							// the cache catches the outgoing secret. NOT an `error` because
+							// it's operationally expected; NOT a `warn` either because at
+							// high message rates this can flood the log with noise that
+							// operators can't act on without the deferred send-side caching
+							// landing first.
+							logger.debug(
+								{
+									...compactContext,
+									targetCacheKey: (originalError as OrphanMsmsgError).targetCacheKey
+								},
+								'msmsg orphan — outgoing message secret not in cache yet'
+							)
 						} else {
 							// Unknown/unexpected errors (protobuf, parsing, etc.) — these
 							// don't go through retry and the stack is actually useful here,

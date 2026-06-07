@@ -55,6 +55,7 @@ import {
 	handleIdentityChange,
 	hkdf,
 	isCorruptedSessionError,
+	makeMsmsgSecretCache,
 	MISSING_KEYS_ERROR_TEXT,
 	NACK_REASONS,
 	NO_MESSAGE_FOUND_ERROR_TEXT,
@@ -188,6 +189,29 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			useClones: false,
 			maxKeys: DEFAULT_CACHE_MAX_KEYS.PLACEHOLDER_RESEND
 		})
+
+	// Per-socket cache of Meta AI / FBID bot message secrets (msmsg). Bounded by
+	// DEFAULT_CACHE_MAX_KEYS.MSMSG_SECRET (500) + 1h TTL. Cleared AND closed on
+	// socket end (see registerSocketEndHandler below) to:
+	//   1. mirror WAWebMsmsgMsgSecretCache's BackendEventBus.onLogout clear and
+	//      avoid cross-account secret leakage when multiple sockets share the
+	//      same Node process; AND
+	//   2. stop the NodeCache `checkperiod` setInterval timer so frequent
+	//      reconnects (network flap / multi-tenant pools) don't leak one timer
+	//      per disconnect (audit P2 thread 8).
+	// Upstream PR #2592 uses an unbounded module-global Map (cubic P1, coderabbit
+	// Major) — we fix that AND the timer leak.
+	const msmsgSecretCache = makeMsmsgSecretCache()
+	registerSocketEndHandler(async () => {
+		try {
+			msmsgSecretCache.flushAll()
+			// close() releases the periodic-check setInterval — without it each
+			// reconnect leaves a stale timer alive.
+			msmsgSecretCache.close()
+		} catch {
+			// flushAll/close never throw on a healthy cache, but defensive on shutdown
+		}
+	})
 
 	/**
 	 * Stage 9 (upstream #2579): single-flight guard for `requestPlaceholderResend`.
@@ -2956,13 +2980,14 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			return
 		}
 
-		const encNode = getBinaryNodeChild(node, 'enc')
-		// TODO: temporary fix for crashes and issues resulting of failed msmsg decryption
-		if (encNode?.attrs.type === 'msmsg') {
-			logger.debug({ key: node.attrs.key }, 'ignored msmsg')
-			await sendMessageAck(node, NACK_REASONS.MissingMessageSecret)
-			return
-		}
+		// Note on `<enc type="msmsg">`: upstream baileys (and the previous InfiniteAPI
+		// release) NACK'd these unconditionally with MissingMessageSecret because the
+		// Meta AI / FBID bot decryption was unimplemented. We now route msmsg into
+		// `decryptMessageNode` via the per-socket `msmsgSecretCache` — see the algorithm
+		// notes in `src/Utils/meta-ai-msmsg.ts` (HKDF + AES-GCM derivation validated
+		// against the WA Web `WAWebBotMessageSecret` source). If decryption ultimately
+		// fails (no secret in cache → `OrphanMsmsgError`), the outer catch below NACKs
+		// the stanza the same as any other handle-time failure.
 
 		// `acked` tracks whether ANY ack/receipt was already sent for this node.
 		// The outer catch below uses it to send a single NACK on unexpected errors
@@ -2980,7 +3005,14 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				category,
 				author,
 				decrypt
-			} = decryptMessageNode(node, authState.creds.me!.id, authState.creds.me!.lid || '', signalRepository, logger)
+			} = decryptMessageNode(
+				node,
+				authState.creds.me!.id,
+				authState.creds.me!.lid || '',
+				signalRepository,
+				logger,
+				msmsgSecretCache
+			)
 
 			const alt = msg.key.participantAlt || msg.key.remoteJidAlt
 			// Handle LID/PN mappings with hybrid approach:
