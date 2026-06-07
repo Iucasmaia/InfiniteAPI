@@ -120,7 +120,50 @@ export function makeCacheableSignalKeyStore(
 			maxKeys: DEFAULT_CACHE_MAX_KEYS.SIGNAL_STORE
 		})
 
-	// Mutex for protecting cache operations
+	// Mutex retained to serialize `clear()` against itself ONLY. Port of
+	// upstream PR #2593 (`perf(auth): remove global mutex from cacheable
+	// signal key store`) adapted for our fork:
+	//
+	//   - get() and set() no longer serialize through this mutex. Upstream's
+	//     argument holds: the cache is a read-through / write-through layer
+	//     and the durable store IS the source of truth. The worst a race can
+	//     do is trigger a redundant `store.get` for the same missing id
+	//     (idempotent) or have two writers repopulate the same entry with the
+	//     same value. Serializing every signal key access through one lock
+	//     created contention on hot paths (decrypt fan-out, group sender
+	//     keys, pre-key reads) for no correctness benefit.
+	//
+	//   - Read-modify-write that genuinely requires serialization (pre-key
+	//     consumption, transactional batches) is handled by
+	//     `addTransactionCapability` below using `makeLockManager()`
+	//     per-record locks — already in our tree as the Stage 1 (upstream
+	//     #2571) port. The previously-stale note on `set()` claiming
+	//     "Stage 1 not yet ported" was out of date and has been removed.
+	//
+	//   - `clear()` still acquires this mutex, but the scope of that
+	//     protection is narrow: it ONLY serializes `clear()` against another
+	//     concurrent `clear()`. It does NOT exclude `get()`/`set()` because
+	//     those no longer acquire the mutex — i.e. a concurrent set() CAN
+	//     interleave between `cache.flushAll()` and `store.clear?.()` here.
+	//     That race is the same one upstream PR #2593 accepts by removing
+	//     the mutex entirely. We keep it for the cheaper guarantee:
+	//     `clear()` callers (destroy, disconnect) shouldn't double-fire and
+	//     undo each other's `store.clear?.()` half-way through a flushAll.
+	//     The benefit is modest; the cost (contention against the rare
+	//     clear() path) is near-zero, so the mutex stays as a defensive
+	//     scaffold against double-clear interleaving — not as a barrier
+	//     against concurrent get/set.
+	//
+	// The other invariants this file depends on are unchanged and do NOT
+	// rely on a global lock:
+	//
+	//   - H6 closure (#2574 port): set() awaits `store.set` BEFORE touching
+	//     the cache. If store throws, the cache stays untouched. Ordering is
+	//     local to each set() call.
+	//   - Stage 5 null tombstone (#2575 port): null values are evicted in
+	//     set() and filtered as miss in get(). Pure per-call logic.
+	//   - safeCacheSet (BOT-001): swallows ECACHEFULL with debug log so
+	//     cache saturation never propagates as a fake store failure.
 	const cacheMutex = new Mutex()
 
 	function getUniqueId(type: string, id: string) {
@@ -150,88 +193,93 @@ export function makeCacheableSignalKeyStore(
 
 	return {
 		async get(type, ids) {
-			return cacheMutex.runExclusive(async () => {
-				const data: { [_: string]: SignalDataTypeMap[typeof type] } = {}
-				const idsToFetch: string[] = []
+			const data: { [_: string]: SignalDataTypeMap[typeof type] } = {}
+			const idsToFetch: string[] = []
 
-				for (const id of ids) {
-					const item = (await cache.get<SignalDataTypeMap[typeof type]>(getUniqueId(type, id))) as any
-					// Stage 5 null tombstone fix (adapted from upstream #2575):
-					// `null` is the SignalDataSet delete sentinel. A cached `null`
-					// must be treated as a miss — `get` returns "absent" by
-					// omitting the id, not "present with value null". Without
-					// this filter, libsignal would observe tombstones.
-					if (typeof item !== 'undefined' && item !== null) {
+			for (const id of ids) {
+				const item = (await cache.get<SignalDataTypeMap[typeof type]>(getUniqueId(type, id))) as any
+				// Stage 5 null tombstone fix (adapted from upstream #2575):
+				// `null` is the SignalDataSet delete sentinel. A cached `null`
+				// must be treated as a miss — `get` returns "absent" by
+				// omitting the id, not "present with value null". Without
+				// this filter, libsignal would observe tombstones.
+				if (typeof item !== 'undefined' && item !== null) {
+					data[id] = item
+				} else {
+					idsToFetch.push(id)
+				}
+			}
+
+			if (idsToFetch.length) {
+				logger?.trace({ items: idsToFetch.length }, 'loading from store')
+				const fetched = await store.get(type, idsToFetch)
+				for (const id of idsToFetch) {
+					const item = fetched[id]
+					// Treat null/undefined uniformly — only populate `data` and the
+					// cache when there's a real value. Caching `null` would
+					// re-introduce the tombstone-as-cache-hit bug for the next
+					// reader within TTL.
+					if (item !== null && item !== undefined) {
 						data[id] = item
-					} else {
-						idsToFetch.push(id)
+						// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+						await safeCacheSet(getUniqueId(type, id), item as SignalDataTypeMap[keyof SignalDataTypeMap])
 					}
 				}
+			}
 
-				if (idsToFetch.length) {
-					logger?.trace({ items: idsToFetch.length }, 'loading from store')
-					const fetched = await store.get(type, idsToFetch)
-					for (const id of idsToFetch) {
-						const item = fetched[id]
-						// Treat null/undefined uniformly — only populate `data` and the
-						// cache when there's a real value. Caching `null` would
-						// re-introduce the tombstone-as-cache-hit bug for the next
-						// reader within TTL.
-						if (item !== null && item !== undefined) {
-							data[id] = item
-							// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
-							await safeCacheSet(getUniqueId(type, id), item as SignalDataTypeMap[keyof SignalDataTypeMap])
-						}
-					}
-				}
-
-				return data
-			})
+			return data
 		},
 		async set(data) {
-			return cacheMutex.runExclusive(async () => {
-				// H6 closure (adapted from upstream #2574):
-				// Durable write FIRST; cache update only after success. If `store.set`
-				// throws, the cache stays untouched and subsequent `get` reads return
-				// the previous committed value (or fall back to the store), never an
-				// unpersisted one that would linger until TTL expiry.
-				//
-				// Note: we keep the existing global `cacheMutex` rather than adopting
-				// upstream's per-record LockManager — that change depends on Stage 1
-				// (#2571) which is not yet ported. The write-through inversion is the
-				// load-bearing part of the H6 fix.
-				await store.set(data)
+			// H6 closure (adapted from upstream #2574):
+			// Durable write FIRST; cache update only after success. If `store.set`
+			// throws, the cache stays untouched and subsequent `get` reads return
+			// the previous committed value (or fall back to the store), never an
+			// unpersisted one that would linger until TTL expiry.
+			//
+			// The store-first ordering is local to this call and does NOT need a
+			// global mutex to hold: a concurrent set() for a DIFFERENT key/type
+			// is unaffected (cache is per-key), and concurrent sets to the SAME
+			// key are serialized by `addTransactionCapability`'s per-record
+			// `LockManager` whenever they originate inside a transaction (which
+			// libsignal's pre-key / session / sender-key writes always do).
+			await store.set(data)
 
-				let keys = 0
-				for (const type in data) {
-					for (const id in data[type as keyof SignalDataTypeMap]) {
-						const value = data[type as keyof SignalDataTypeMap]![id]
-						// Stage 5 null tombstone fix (adapted from upstream #2575):
-						// `null` is the delete sentinel — evict rather than caching
-						// `null`. Otherwise the read path (post-tombstone filter)
-						// would treat the slot as a cache hit and short-circuit the
-						// store lookup, masking later writes from sibling adapters
-						// until TTL expiry.
-						if (value === null || value === undefined) {
-							await cache.del(getUniqueId(type, id))
-						} else {
-							await safeCacheSet(getUniqueId(type, id), value)
-						}
-
-						keys += 1
+			let keys = 0
+			for (const type in data) {
+				for (const id in data[type as keyof SignalDataTypeMap]) {
+					const value = data[type as keyof SignalDataTypeMap]![id]
+					// Stage 5 null tombstone fix (adapted from upstream #2575):
+					// `null` is the delete sentinel — evict rather than caching
+					// `null`. Otherwise the read path (post-tombstone filter)
+					// would treat the slot as a cache hit and short-circuit the
+					// store lookup, masking later writes from sibling adapters
+					// until TTL expiry.
+					if (value === null || value === undefined) {
+						await cache.del(getUniqueId(type, id))
+					} else {
+						await safeCacheSet(getUniqueId(type, id), value)
 					}
-				}
 
-				logger?.trace({ keys }, 'updated cache')
-			})
+					keys += 1
+				}
+			}
+
+			logger?.trace({ keys }, 'updated cache')
 		},
 		async clear() {
-			// PR #453 round-4 (Copilot): synchronize clear with the same
-			// `cacheMutex` that guards get/set. Without this, a concurrent set()
-			// could land between `cache.flushAll()` and `store.clear()` (or
-			// after), repopulating the cache with values that no longer reflect
-			// the just-cleared store. Holding the mutex across the full clear
-			// op ensures no get/set observes a half-cleared state.
+			// Deliberate deviation from upstream PR #2593: `clear()` continues
+			// to acquire `cacheMutex`. The lock here ONLY serializes `clear()`
+			// against another concurrent `clear()` — it does NOT exclude
+			// `get()`/`set()` (those no longer acquire the mutex, so they may
+			// still interleave between `cache.flushAll()` and `store.clear?.()`
+			// below). That get/set interleaving race is the same one upstream
+			// accepts. The benefit we keep is narrower: when two `clear()`
+			// callers fire concurrently (destroy + disconnect overlap, for
+			// example), one must complete its full flushAll + store.clear?.()
+			// pair before the other starts, so the second clear doesn't observe
+			// a half-flushed cache or double-call the store's clear method.
+			// `clear()` is invoked only on lifecycle teardown — the contention
+			// cost of this narrow lock is essentially zero.
 			return cacheMutex.runExclusive(async () => {
 				await cache.flushAll()
 				await store.clear?.()

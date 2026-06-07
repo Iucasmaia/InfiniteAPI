@@ -2236,8 +2236,19 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 				if (updatedDevices.length === 0) {
 					await userDevicesCache?.del(user)
-				} else {
-					await userDevicesCache?.set(user, updatedDevices)
+				} else if (userDevicesCache) {
+					// PR #513 review (chatgpt-codex P2): mirror the ECACHEFULL
+					// handling already in place for `userDevicesCache.set` in
+					// messages-send.ts. With the `maxKeys` cap added in PR
+					// #509, `@cacheable/node-cache` throws ECACHEFULL when
+					// `keyCount() + 1 > maxKeys` — and that check is hit even
+					// for an UPDATE of an already-cached key when the cache
+					// is at capacity, because the underlying `set` doesn't
+					// short-circuit on existing-key writes. `safeCacheSet`
+					// swallows the throw with a debug log; the durable USync
+					// state is unaffected (next message-send will re-fetch
+					// via `getUSyncDevices`, same fallback semantics).
+					await safeCacheSet(userDevicesCache, user, updatedDevices, logger, 'userDevicesCache')
 				}
 			}
 		})
