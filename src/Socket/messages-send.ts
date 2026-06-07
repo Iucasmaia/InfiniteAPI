@@ -2,7 +2,7 @@ import NodeCache from '@cacheable/node-cache'
 import { Boom } from '@hapi/boom'
 import { randomBytes } from 'crypto'
 import { proto } from '../../WAProto/index.js'
-import { DEFAULT_CACHE_TTLS, URL_REGEX, WA_DEFAULT_EPHEMERAL } from '../Defaults'
+import { DEFAULT_CACHE_MAX_KEYS, DEFAULT_CACHE_TTLS, URL_REGEX, WA_DEFAULT_EPHEMERAL } from '../Defaults'
 import type {
 	AlbumMediaItem,
 	AlbumMediaResult,
@@ -40,6 +40,7 @@ import {
 	normalizeMessageContent,
 	parseAndInjectE2ESessions,
 	runDetached,
+	safeCacheSet,
 	unixTimestampSeconds
 } from '../Utils'
 import { logMessageSent, logTcToken } from '../Utils/baileys-logger'
@@ -198,7 +199,16 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		config.userDevicesCache ||
 		new NodeCache<JidWithDevice[]>({
 			stdTTL: DEFAULT_CACHE_TTLS.USER_DEVICES, // 5 minutes
-			useClones: false
+			useClones: false,
+			// Audit memory — cap defined in DEFAULT_CACHE_MAX_KEYS but never
+			// applied here. NodeCache TTL re-extends on every `.set()`, so
+			// under sustained traffic the TTL never expires; only `maxKeys`
+			// provides a hard ceiling. Empirical Frida capture on WA Android
+			// 2.26.21.75 confirms each outbound group msg can lazy-discover
+			// a new device → in a gateway with 50 active groups × 100 members
+			// × 1.5 devices avg the cache hits ~7,500 entries (already over
+			// the intended 5,000 cap).
+			maxKeys: DEFAULT_CACHE_MAX_KEYS.USER_DEVICES
 		})
 	/** Serializes writes to userDevicesCache across USync refresh and device-notification handling. */
 	const devicesMutex = makeMutex()
@@ -525,12 +535,36 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			}
 
 			await devicesMutex.mutex(async () => {
+				// Audit ECACHEFULL — @cacheable/node-cache throws "Cache max keys amount
+				// exceeded" when `maxKeys` is reached (instead of LRU-evicting). For
+				// `mset` we fall back to a per-key path on ECACHEFULL so partial writes
+				// don't surface as send failures; for `.set` we route through
+				// `safeCacheSet` which already swallows ECACHEFULL with a debug log.
+				// Either way, durable state is unaffected — a cache miss next round
+				// triggers a USync refresh, same as a TTL-expired entry.
 				if (userDevicesCache.mset) {
-					// if the cache supports mset, we can set all devices in one go
-					await userDevicesCache.mset(Object.entries(deviceMap).map(([key, value]) => ({ key, value })))
+					try {
+						await userDevicesCache.mset(
+							Object.entries(deviceMap).map(([key, value]) => ({ key, value }))
+						)
+					} catch (err) {
+						const msg = (err as Error)?.message ?? ''
+						if (!msg.includes('max keys') && !msg.includes('ECACHEFULL')) throw err
+						logger.debug(
+							{ entries: Object.keys(deviceMap).length },
+							'userDevicesCache mset hit ECACHEFULL — falling back to per-key safeCacheSet'
+						)
+						for (const key in deviceMap) {
+							if (deviceMap[key]) {
+								await safeCacheSet(userDevicesCache, key, deviceMap[key], logger, 'userDevicesCache')
+							}
+						}
+					}
 				} else {
 					for (const key in deviceMap) {
-						if (deviceMap[key]) await userDevicesCache.set(key, deviceMap[key])
+						if (deviceMap[key]) {
+							await safeCacheSet(userDevicesCache, key, deviceMap[key], logger, 'userDevicesCache')
+						}
 					}
 				}
 			})
