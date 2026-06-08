@@ -16,9 +16,140 @@ import {
 	isPnUser
 	//	transferDevice
 } from '../WABinary'
+import { compactError } from './error-log-utils'
 import { unpadRandomMax16 } from './generics'
 import type { ILogger } from './logger'
+import {
+	cacheMessageSecretIfPresent,
+	decryptMsmsgBotMessage,
+	extractMsmsgStanzaInfo,
+	type MsmsgSecretCache,
+	OrphanMsmsgError
+} from './meta-ai-msmsg'
 import { retry, RetryExhaustedError, type RetryOptions } from './retry-utils'
+
+/**
+ * Re-used sentinel for the msgBuffer initializer when the e2e type is `msmsg`
+ * (which decodes via decryptMsmsgBotMessage and bypasses the generic
+ * `proto.Message.decode(msgBuffer)` path entirely). Avoids `noUnusedLocals` /
+ * `used-before-assignment` warnings without paying a per-call alloc.
+ */
+const EMPTY_UINT8_ARRAY = new Uint8Array(0)
+
+/**
+ * Unwrap a `deviceSentMessage` envelope while preserving fields from the OUTER
+ * `Message` that the inner payload would otherwise lose. WhatsApp ships some
+ * fields — most importantly `messageContextInfo.messageSecret` — on the OUTER
+ * `Message` and an empty / partial `messageContextInfo` on the inner. The
+ * previous unwrap `msg = msg.deviceSentMessage?.message || msg` silently
+ * dropped those outer fields.
+ *
+ * Why this matters operationally:
+ *   - Encrypted edit envelopes (upstream PR #2554) need the original
+ *     `messageContextInfo.messageSecret` to derive the edit key. If the
+ *     upsert dropped the secret on the fromMe-via-linked-device delivery,
+ *     `getMessage` later returns the cached message WITHOUT the secret and
+ *     the edit decrypt fails.
+ *   - Our Meta AI / FBID bot msmsg cache (`cacheMessageSecretIfPresent`,
+ *     called immediately after this unwrap) needs the secret to land
+ *     against the outgoing message's id so subsequent bot replies can
+ *     decrypt. Without preserving the outer context info, single-device
+ *     and linked-device flows both miss the cache for the very first
+ *     reply (the audit gap codex flagged on PR #518).
+ *
+ * Why a per-field merge instead of a generic `{...outer, ...inner}` spread
+ * (upstream PR #2566's approach): upstream's spread lets the inner message's
+ * `messageContextInfo` ENTIRELY override the outer's. If the inner ships a
+ * partial `messageContextInfo` (e.g. just `threadId`), the outer's
+ * `messageSecret` is lost. WA Web's `WAWebDeviceSentMessageProtoUtils.l(e)`
+ * (extracted via CDP, validated against live captures) merges field-by-field:
+ * inner is preferred when present, otherwise outer is used. Each field that
+ * matters for downstream decoders is named explicitly. The fall-through
+ * `...inner.messageContextInfo` preserves any other future fields whichever
+ * side carried them.
+ *
+ * Returns the input unchanged when there is no `deviceSentMessage` envelope.
+ */
+const unwrapDeviceSentMessage = (msg: proto.IMessage): proto.IMessage => {
+	const inner = msg.deviceSentMessage?.message
+	if (!inner) return msg
+
+	const innerCtx = inner.messageContextInfo
+	const outerCtx = msg.messageContextInfo
+
+	// Inner-preferred merge for every messageContextInfo field that
+	// WhatsApp Web's `l(e)` handles explicitly. Inner takes precedence so
+	// message-local context (the explicit intent of the inner sender) is not
+	// overwritten by an outer envelope value — except `limitSharingV2` which
+	// WA Web sources from the OUTER only (the message-local inner has no
+	// say in the policy attached to the linked-device fanout).
+	const messageContextInfo: proto.IMessageContextInfo = {
+		...innerCtx,
+		messageSecret: innerCtx?.messageSecret ?? outerCtx?.messageSecret,
+		messageAssociation: innerCtx?.messageAssociation ?? outerCtx?.messageAssociation,
+		limitSharingV2: outerCtx?.limitSharingV2,
+		// `threadId` is a `repeated` field in the proto, which `protobufjs`
+		// decodes as `[]` (empty array) when absent on the wire — NOT
+		// `undefined`. A plain `innerCtx.threadId ?? outerCtx.threadId` would
+		// therefore never fall through to the outer side, silently dropping
+		// any thread context the outer envelope carried. Treat an empty
+		// inner array as "inner didn't set it" so the outer wins. Spec-pinned
+		// against `WAWebDeviceSentMessageProtoUtils.l(e)` whose JS source has
+		// the same length-check semantics (chatgpt + cubic audit P2).
+		threadId: (innerCtx?.threadId?.length ? innerCtx.threadId : null) ?? outerCtx?.threadId ?? [],
+		botMetadata: innerCtx?.botMetadata ?? outerCtx?.botMetadata
+	}
+
+	return { ...inner, messageContextInfo }
+}
+
+/**
+ * Extracted to keep the inline e2e-type switch under the `max-depth: 4` lint
+ * rule. The msmsg branch otherwise needs an extra `if (e2eType === 'msmsg')`
+ * level inside the existing `try { switch { case '...' } }` block, pushing the
+ * sender-key-distribution `if/try` further down to depth 5.
+ *
+ * Note on `lidToPn`: WAWebLidMigrationUtils.toPn is sync in WA Web (looks up
+ * an in-memory map). Our LIDMappingStore.getPNForLID is async, so we can't
+ * call it from this sync block without restructuring the wider decrypt flow.
+ * Empirically the Meta AI "oi" capture is 1:1 (no participant in the cache
+ * key) — group bot chats are the only case that needs LID→PN, and they fall
+ * back to using the raw LID as the participant component. If group bot
+ * support is needed later, pass a pre-resolved sync mapper here.
+ */
+const decodeIncomingMsmsg = (args: {
+	content: Uint8Array
+	msmsgCache: MsmsgSecretCache | undefined
+	msmsgInfo: ReturnType<typeof extractMsmsgStanzaInfo>
+	fullMessage: WAMessage
+	stanza: BinaryNode
+	author: string
+	sender: string
+	meLid: string
+	meId: string
+	logger: ILogger
+}): proto.IMessage => {
+	const { content, msmsgCache, msmsgInfo, fullMessage, stanza, author, sender, meLid, meId, logger } = args
+	if (!msmsgCache) {
+		throw new Error('Meta AI msmsg received but no MsmsgSecretCache was wired into decryptMessageNode')
+	}
+	if (!msmsgInfo) {
+		throw new Error('msmsg enc without companion <meta target_id> node')
+	}
+	return decryptMsmsgBotMessage({
+		ciphertext: content,
+		stanzaInfo: msmsgInfo,
+		stanzaId: fullMessage.key.id || stanza.attrs.id || '',
+		authorJid: author,
+		chatJid: sender,
+		isGroup: isJidGroup(sender) ?? false,
+		isFbidBot: isJidMetaAI(author) ?? false,
+		meLid,
+		meId,
+		cache: msmsgCache,
+		logger
+	})
+}
 
 export const getDecryptionJid = async (sender: string, repository: SignalRepositoryWithLIDStore): Promise<string> => {
 	if (isLidUser(sender) || isHostedLidUser(sender)) {
@@ -335,9 +466,25 @@ export const decryptMessageNode = (
 	meId: string,
 	meLid: string,
 	repository: SignalRepositoryWithLIDStore,
-	logger: ILogger
+	logger: ILogger,
+	/**
+	 * Optional per-socket cache of (cacheKey → messageSecret) used to decrypt
+	 * `<enc type="msmsg">` (Meta AI / FBID bot replies). Caller (Socket layer)
+	 * supplies one instance per connection. When absent and an msmsg stanza
+	 * does arrive, `decodeIncomingMsmsg` throws a dedicated `Error('Meta AI
+	 * msmsg received but no MsmsgSecretCache was wired into decryptMessageNode')`
+	 * — not the generic "Unknown e2e type" path — so misconfiguration surfaces
+	 * with a precise message rather than being silently NACKed.
+	 */
+	msmsgCache?: MsmsgSecretCache
 ) => {
 	const { fullMessage, author, sender } = decodeMessageNode(stanza, meId, meLid)
+
+	// Pre-scan for msmsg metadata children (<meta target_id>, <bot edit>, etc.).
+	// extractMsmsgStanzaInfo returns null unless an enc child with type=msmsg
+	// is present, so this is a no-op for ordinary pkmsg/skmsg stanzas.
+	const msmsgInfo = extractMsmsgStanzaInfo(stanza)
+
 	return {
 		fullMessage,
 		category: stanza.attrs.category,
@@ -372,7 +519,10 @@ export const decryptMessageNode = (
 
 					decryptables += 1
 
-					let msgBuffer: Uint8Array
+					// Initialized for skmsg/pkmsg/msg/plaintext paths. The msmsg path
+					// short-circuits the generic decode by setting msg directly below,
+					// so msgBuffer stays at this sentinel-empty value.
+					let msgBuffer: Uint8Array = EMPTY_UINT8_ARRAY
 
 					const decryptionJid = await getDecryptionJid(author, repository)
 
@@ -428,14 +578,38 @@ export const decryptMessageNode = (
 							case 'plaintext':
 								msgBuffer = content
 								break
+							case 'msmsg':
+								// msmsg is decoded INSIDE decryptMsmsgBotMessage (it returns an
+								// already-decoded IMessage), so leave msgBuffer alone and short-
+								// circuit the generic decode path below.
+								break
 							default:
 								throw new Error(`Unknown e2e type: ${e2eType}`)
 						}
 
-						let msg: proto.IMessage = proto.Message.decode(
-							e2eType !== 'plaintext' ? unpadRandomMax16(msgBuffer) : msgBuffer
-						)
-						msg = msg.deviceSentMessage?.message || msg
+						let msg: proto.IMessage =
+							e2eType === 'msmsg'
+								? decodeIncomingMsmsg({
+										content,
+										msmsgCache,
+										msmsgInfo,
+										fullMessage,
+										stanza,
+										author,
+										sender,
+										meLid,
+										meId,
+										logger
+									})
+								: proto.Message.decode(e2eType !== 'plaintext' ? unpadRandomMax16(msgBuffer) : msgBuffer)
+						msg = unwrapDeviceSentMessage(msg)
+
+						// Cache `messageContextInfo.messageSecret` so subsequent msmsg replies
+						// referencing this message's id can find the decryption secret. Mirrors
+						// WA Web's flow where every decoded msg has its secret stashed in
+						// `WAWebMsmsgMsgSecretCache`.
+						cacheMessageSecretIfPresent(msmsgCache, msg, fullMessage.key, logger)
+
 						if (msg.senderKeyDistributionMessage) {
 							//eslint-disable-next-line max-depth
 							try {
@@ -460,33 +634,43 @@ export const decryptMessageNode = (
 
 						const isCorrupted = isCorruptedSessionError(originalError)
 						const isSessionRecord = isSessionRecordError(originalError)
+						const isOrphanMsmsg = originalError instanceof OrphanMsmsgError
 
-						const errorContext = {
+						// Compact context for the COMMON case (corrupted-session +
+						// no-session-record). Keeps a one-liner per failure instead of the
+						// pino-serialized error object that pulls in the full stack — the
+						// stack is always rooted in `libsignal/session_cipher.js` or
+						// `group_cipher.ts` for these patterns and adds no information.
+						// Unknown errors keep the raw error object (stack matters there).
+						const compactContext = {
 							key: fullMessage.key,
-							err: originalError,
+							err: compactError(originalError),
 							messageType: tag === 'plaintext' ? 'plaintext' : attrs.type,
 							sender,
 							author,
 							decryptionJid,
 							isSessionRecordError: isSessionRecord,
 							isCorruptedSession: isCorrupted,
+							isOrphanMsmsg,
 							...(isRetryExhausted && { retriesExhausted: true, attempts: err.attempts })
 						}
 
-						// Smart logging based on error type and retry status
+						// Smart logging based on error type. Note: `isRetryExhausted` is
+						// always true inside the corrupted/session-record branches —
+						// DECRYPTION_RETRY_OPTIONS.shouldRetry returns false immediately
+						// for corruptedSessionErrors (so retry-utils throws
+						// RetryExhaustedError on attempt 1), and intermediate session-record
+						// retries are absorbed by the internal retry loop via onRetry. By
+						// the time the outer catch fires, the operation has given up.
 						if (isCorrupted) {
-							// Corrupted session errors are expected and auto-recovered
-							// Only log as ERROR if retries exhausted, otherwise WARN on first attempt
-							// eslint-disable-next-line max-depth
-							if (isRetryExhausted) {
-								logger.error(
-									errorContext,
-									`⚠️ Session corrupted after ${err.attempts} attempts. Retry+pkmsg flow will recover.`
-								)
-							} else {
-								// First occurrence - log as warning since auto-recovery will attempt
-								logger.warn(errorContext, '⚠️ Corrupted session detected - attempting auto-recovery')
-							}
+							// Corrupted-session failures are expected operationally: WhatsApp
+							// rotates keys, sends out-of-order group messages, and replays
+							// pkmsg under flaky networks. The retry+pkmsg flow recovers
+							// automatically. Logging these as `error` (level 50) triggers
+							// alerting on something operators can't act on, so emit at warn
+							// — still surfaced if it happens at high frequency for one JID,
+							// but doesn't pollute the error dashboard.
+							logger.warn(compactContext, 'session stale, auto-recovering via retry+pkmsg')
 
 							// Session cleanup is deferred to retry exhaustion (safety net).
 							// The Signal Protocol handles recovery naturally via retry+pkmsg:
@@ -495,19 +679,33 @@ export const decryptMessageNode = (
 							// multiple messages from the same contact arrive simultaneously.
 							// See: messages-recv.ts sendRetryRequest() for deferred cleanup.
 						} else if (isSessionRecord) {
-							// Session record errors are transient - retry should handle them
-							// eslint-disable-next-line max-depth
-							if (isRetryExhausted) {
-								logger.error(errorContext, `Failed to decrypt: No session record found after ${err.attempts} attempts`)
-							} else {
-								logger.debug(errorContext, 'No session record - will retry')
-							}
+							// Session record errors are transient and the internal retry
+							// loop already exhausted its retries before reaching here.
+							logger.warn(compactContext, `no session record after ${err.attempts} attempts, will resync`)
+						} else if (isOrphanMsmsg) {
+							// Meta AI / FBID bot reply arrived but we never saw the outgoing
+							// message that carried `messageContextInfo.messageSecret`. Common
+							// when sending the prompt single-device (no deviceSentMessage
+							// echo to feed the cache) — emit at debug since the user will
+							// retry the prompt naturally and the next reply will succeed if
+							// the cache catches the outgoing secret. NOT an `error` because
+							// it's operationally expected; NOT a `warn` either because at
+							// high message rates this can flood the log with noise that
+							// operators can't act on without the deferred send-side caching
+							// landing first.
+							logger.debug(
+								{
+									...compactContext,
+									targetCacheKey: (originalError as OrphanMsmsgError).targetCacheKey
+								},
+								'msmsg orphan — outgoing message secret not in cache yet'
+							)
 						} else {
-							// Unknown/unexpected errors (protobuf, parsing, etc.)
-							// These don't go through retry, so always log as ERROR
-							// Type-safe explicit logging instead of dynamic property access
+							// Unknown/unexpected errors (protobuf, parsing, etc.) — these
+							// don't go through retry and the stack is actually useful here,
+							// so swap the compact `err` string back for the raw object.
 							logger.error(
-								errorContext,
+								{ ...compactContext, err: originalError },
 								isRetryExhausted
 									? `Failed to decrypt message after ${err.attempts} attempts`
 									: 'Failed to decrypt message'
