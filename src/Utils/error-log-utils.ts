@@ -30,10 +30,10 @@
  * raises `TypeError`, so the object-without-message branch is guarded.
  */
 export const compactError = (err: unknown): string => {
-	// Loose-equality check captures `null` AND `undefined` only — `!err` also
-	// caught `0`, `''`, `false`, `NaN`, which are valid (if unusual) thrown
-	// values. cubic audit thread 9 (PR #521).
-	if (err == null) return 'Unknown'
+	// Nullish-only check captures `null` AND `undefined` only — the previous
+	// `!err` also caught `0`, `''`, `false`, `NaN`, which are valid (if
+	// unusual) thrown values. cubic audit thread 9 (PR #521).
+	if (err === null || err === undefined) return 'Unknown'
 	if (err instanceof Error) {
 		const name = err.name || 'Error'
 		return `${name}: ${err.message}`
