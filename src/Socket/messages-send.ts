@@ -1178,12 +1178,24 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		const devices: DeviceWithJid[] = []
 		let reportingMessage: proto.IMessage | undefined
 
+		// `messageContextInfo` (carries the reporting token / messageSecret) for
+		// the DSM envelope is normally read from the top-level `message`. For
+		// stickers wrapped in `lottieStickerMessage` (proto field 74), that top
+		// level is the wrap itself and the real context info lives one level
+		// deeper at `message.lottieStickerMessage.message.messageContextInfo`.
+		// Read it from there when the wrapper is present so the sender's other
+		// devices (DSM recipients) receive the same reporting token + secret as
+		// the primary recipient — otherwise multi-device flows would drop the
+		// token on every Lottie sticker send.
+		const dsmMessageContextInfo =
+			message.lottieStickerMessage?.message?.messageContextInfo ?? message.messageContextInfo
+
 		const meMsg: proto.IMessage = {
 			deviceSentMessage: {
 				destinationJid,
 				message
 			},
-			messageContextInfo: message.messageContextInfo
+			messageContextInfo: dsmMessageContextInfo
 		}
 
 		const extraAttrs: BinaryNodeAttributes = {}
@@ -1563,14 +1575,27 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					}
 				}
 
-				// Send DSM for all message types including carousel
+				// Send DSM for all message types including carousel.
+				// Mirrors the same `messageContextInfo` lift done on the initial-
+				// fanout DSM build (line ~1198 — release PR #519 fix): Lottie
+				// stickers wrap their `messageContextInfo` inside
+				// `lottieStickerMessage.message`, so the retry-resend envelope
+				// needs to lift it back to the DSM top-level just like the initial
+				// send does. Without this, the sender's other devices receive the
+				// retry without `messageSecret` / reporting token and the next
+				// edit / msmsg reply can't be decrypted on those devices.
+				// (audit thread 5 / coderabbit Major on release PR #521)
+				const retryDsmContextInfo =
+					messageToSend.lottieStickerMessage?.message?.messageContextInfo ??
+					messageToSend.messageContextInfo
 				const usesDSM = isMe
 				const encodedMessageToSend = usesDSM
 					? encodeWAMessage({
 							deviceSentMessage: {
 								destinationJid,
 								message: messageToSend
-							}
+							},
+							messageContextInfo: retryDsmContextInfo
 						})
 					: encodeWAMessage(messageToSend)
 
@@ -1866,10 +1891,19 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				logger.debug({ jid }, 'adding device identity')
 			}
 
+			// Lottie stickers (`{ lottieStickerMessage: { message: outer }}`) carry
+			// their `messageContextInfo` INSIDE the wrap — read both spots so the
+			// reporting-token attachment works the same for wrapped and unwrapped
+			// stickers (audit thread 1 / chatgpt P2 on release PR #521).
+			const reportingMessageSecret =
+				reportingMessage?.lottieStickerMessage?.message?.messageContextInfo?.messageSecret ??
+				reportingMessage?.messageContextInfo?.messageSecret
+
 			if (
 				!isNewsletter &&
 				!isRetryResend &&
-				reportingMessage?.messageContextInfo?.messageSecret &&
+				reportingMessage &&
+				reportingMessageSecret &&
 				shouldIncludeReportingToken(reportingMessage)
 			) {
 				try {
@@ -2354,6 +2388,17 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		} else if (message.liveLocationMessage) {
 			return 'livelocation'
 		} else if (message.stickerMessage) {
+			return 'sticker'
+		} else if (message.lottieStickerMessage) {
+			// Lottie animated stickers (`.was`) ship wrapped in
+			// `lottieStickerMessage` (FutureProofMessage at proto field 74).
+			// `runSendBody` calls `getMediaType(message)` directly without
+			// normalizing the wrapper first, so without this branch the
+			// `mediatype="sticker"` enc attribute is missing — newsletter
+			// channel sends would ACK 479 and silently drop, and 1-on-1 push
+			// notifications would lose their "sent a sticker" label. Match
+			// the same return as the plain `stickerMessage` arm: WA's CDN
+			// routes both formats through the same `sticker` media bucket.
 			return 'sticker'
 		} else if (message.listMessage) {
 			return 'list'
