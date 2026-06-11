@@ -1260,8 +1260,64 @@ function signalStorage(
 			const wireJid = await resolveLIDSignalAddress(id)
 			await keys.set({ session: { [wireJid]: session.serialize() } })
 		},
-		isTrustedIdentity: () => {
-			return true // todo: implement proper trust management
+		/**
+		 * Trust check called by libsignal on every encrypt / decrypt /
+		 * initOutgoing. Returning `false` would throw "Untrusted identity"
+		 * at the native level and HARD-BLOCK the operation.
+		 *
+		 * audit SIG-A2 — earlier this was `return true` unconditionally,
+		 * which is fine as a TOFU rule (trust on first use) but leaves zero
+		 * audit trail when a known peer's identity actually changes — and
+		 * SIG-A1 (the dead `extractIdentityFromPkmsg`) meant the upstream
+		 * `identity.changed` event never fired either. With SIG-A1 fixed,
+		 * we now have a working identity-change signal in `saveIdentity`.
+		 *
+		 * Strategy here: still TRUST (return true) to avoid breakage when a
+		 * peer legitimately reinstalls WhatsApp, but log a WARN on key
+		 * divergence so an operator can correlate it with abuse signals.
+		 * A future PR can promote this to a configurable strict-mode that
+		 * REJECTS unknown changes for high-security deployments.
+		 */
+		isTrustedIdentity: (id: string, identityKey: Uint8Array): boolean => {
+			// libsignal's `isTrustedIdentity` is a SYNC predicate (it's called
+			// from native code paths that don't await). We therefore can't
+			// reach `keys.get('identity-key', ...)` here — that's async.
+			// The next-best signal is the in-memory LRU populated by
+			// `loadIdentityKey` / `saveIdentity`. A cache hit lets us log a
+			// WARN when the wire's identity diverges from what we knew last;
+			// a miss falls through to the TOFU default (trust). A future PR
+			// can promote this to strict-mode rejection when the WARN fires.
+			try {
+				// `saveIdentity` AND `loadIdentityKey` both populate the cache
+				// under BOTH the raw `id` AND the resolved `wireJid` spelling
+				// (after the audit-thread-11 fix). So a single get(id) lookup
+				// catches every entry written through either path.
+				const cached = identityKeyCache.get(id)
+				if (identityKey?.length === cached?.length) {
+					let diverged = false
+					for (let i = 0; i < cached.length; i++) {
+						if (cached[i] !== identityKey[i]) {
+							diverged = true
+							break
+						}
+					}
+
+					if (diverged) {
+						logger?.warn(
+							{
+								id,
+								oldFingerprint: generateKeyFingerprint(cached),
+								newFingerprint: generateKeyFingerprint(identityKey)
+							},
+							'isTrustedIdentity: peer identity key CHANGED (still trusted — TOFU). Audit correlation: SIG-A2'
+						)
+					}
+				}
+			} catch (err) {
+				logger?.debug({ err, id }, 'isTrustedIdentity: cache check failed')
+			}
+
+			return true
 		},
 		loadPreKey: async (id: number | string) => {
 			const keyId = id.toString()
@@ -1372,8 +1428,16 @@ function signalStorage(
 				const key = stored[wireJid] ?? stored[id]
 
 				if (key) {
-					// Populate cache under the resolved name only.
+					// Populate cache under BOTH spellings — matches the dual
+					// write in `saveIdentity`. Earlier this only cached the
+					// resolved `wireJid`, leaving `isTrustedIdentity(id)`'s
+					// sync cache lookup with a miss when called with the raw
+					// `id` before any save had happened. (audit thread 11)
 					identityKeyCache.set(wireJid, key)
+					if (wireJid !== id) {
+						identityKeyCache.set(id, key)
+					}
+
 					return key
 				}
 

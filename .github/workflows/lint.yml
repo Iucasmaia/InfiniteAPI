@@ -49,9 +49,11 @@ jobs:
           YARN_HTTP_RETRY: 10
         run: yarn install --immutable
 
-      - name: Auto-fix formatting
-        run: yarn lint:fix
-        continue-on-error: true
-
+      # audit CI-01: `lint:fix` modifies the working tree in place. Running
+      # it before `lint` meant `lint` saw the auto-corrected source and PRs
+      # were waved through even though the branch as committed still had the
+      # errors. The gate is `yarn lint` — run nothing that can heal the tree
+      # before it. Developers should run `yarn lint:fix` locally before
+      # pushing (it's wired up as `lint:fix` in package.json scripts).
       - name: Check linting
         run: yarn lint
