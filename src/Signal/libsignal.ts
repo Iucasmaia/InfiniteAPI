@@ -153,13 +153,20 @@ function generateKeyFingerprint(key: Uint8Array): string {
  * - Byte 0: Version byte (high nibble = current version, low nibble = 3)
  * - Bytes 1+: Protobuf-encoded PreKeySignalMessage
  *
- * The protobuf contains:
- * - registrationId (uint32)
- * - preKeyId (uint32, optional)
- * - signedPreKeyId (uint32)
- * - baseKey (bytes, 33 bytes - Curve25519 public key)
- * - identityKey (bytes, 33 bytes - Curve25519 public key)
- * - message (bytes - the actual encrypted message)
+ * Per libsignal's spec (WhisperTextProtocol.proto, PreKeySignalMessage):
+ *   field 1: preKeyId       (uint32, varint, wireType 0)
+ *   field 2: baseKey        (bytes 33, wireType 2)
+ *   field 3: identityKey    (bytes 33, wireType 2)  ← what we want
+ *   field 4: message        (bytes, wireType 2)
+ *   field 5: registrationId (uint32, varint, wireType 0)
+ *   field 6: signedPreKeyId (uint32, varint, wireType 0)
+ *
+ * Earlier code looked for `fieldNumber === 5` here (audit SIG-A1) — that's
+ * `registrationId`, which is a varint, not a 33-byte key. Combined with the
+ * `wireType === 2` filter the function never matched anything and always
+ * returned `undefined`. Net effect: identity-change detection in
+ * `decryptMessage` (and the resulting `identity.changed` event +
+ * reinstall-triggered session cleanup) was dead code in production.
  *
  * We manually parse the protobuf to extract identityKey without depending on
  * the full protobuf library, making this compatible with any Signal implementation.
@@ -210,8 +217,9 @@ function extractIdentityFromPkmsg(ciphertext: Uint8Array, logger?: ILogger): Uin
 				const length = lengthResult.value
 				offset = lengthResult.nextOffset
 
-				// Field 5 is identityKey
-				if (fieldNumber === 5) {
+				// Field 3 is identityKey — see comment block above for spec ref.
+				// (audit SIG-A1: was `fieldNumber === 5` which is registrationId, varint.)
+				if (fieldNumber === 3) {
 					// Validate key length
 					// eslint-disable-next-line max-depth
 					if (length !== IDENTITY_KEY_LENGTH) {
@@ -289,6 +297,14 @@ function readVarint(buffer: Uint8Array, offset: number): { value: number; nextOf
 
 	while (offset < buffer.length) {
 		const byte = buffer[offset]!
+		// On byte 5 (shift === 28) only the low 4 bits can fit inside a
+		// 32-bit varint — the top 4 bits would land at positions 32–35 and
+		// silently fall off the uint32. `>>> 0` masks the overflow without
+		// signalling it, so a crafted payload could encode a value
+		// arbitrarily larger than 2³² – 1 and still parse cleanly. Reject
+		// it the same way the 6-byte case is rejected by the `shift >= 35`
+		// guard below.
+		if (shift === 28 && (byte & 0xf0) !== 0) return undefined
 		result |= (byte & 0x7f) << shift
 
 		offset++
@@ -297,7 +313,17 @@ function readVarint(buffer: Uint8Array, offset: number): { value: number; nextOf
 		}
 
 		shift += 7
-		if (shift > 35) {
+		// Reject once shift would reach 35 — NOT just exceed it. The 5
+		// valid byte shifts are 0, 7, 14, 21, 28. After processing byte 4
+		// (`shift` was 28), this increment makes `shift = 35`. With a
+		// `shift > 35` guard, byte 5 would still be read on the next loop
+		// iteration and `(byte & 0x7f) << 35` would silently fold into
+		// `<< 3` because JS `<<` is modulo-32 on the right operand —
+		// producing a corrupt value that the outer `>>> 0` would happily
+		// accept as a valid uint32, neutralising the
+		// `extractIdentityFromPkmsg` field-3 (identityKey) parse on
+		// crafted pkmsg payloads.
+		if (shift >= 35) {
 			// Varint too long (max 5 bytes for 32-bit)
 			// This could indicate a malformed or malicious message
 			// Caller should log this condition at debug level
@@ -1148,35 +1174,32 @@ function signalStorage(
 	ev?: BaileysEventEmitter,
 	logger?: ILogger
 ): ExtendedSignalStorage {
-	// Shared function to resolve PN signal address to LID if mapping exists
-	const resolveLIDSignalAddress = async (id: string): Promise<string> => {
-		if (id.includes('.')) {
-			const [deviceId, device] = id.split('.')
-			if (!deviceId) {
-				throw new Error('Missing device ID')
-			}
-
-			const [user, domainType_] = deviceId.split('_')
-			const domainType = parseInt(domainType_ || '0')
-
-			if (domainType === WAJIDDomains.LID || domainType === WAJIDDomains.HOSTED_LID) return id
-
-			const pnJid = `${user!}${device !== '0' ? `:${device}` : ''}@${domainType === WAJIDDomains.HOSTED ? 'hosted' : 's.whatsapp.net'}`
-
-			const lidForPN = await lidMapping.getLIDForPN(pnJid)
-			if (lidForPN) {
-				const lidAddr = jidToSignalProtocolAddress(lidForPN)
-				return lidAddr.toString()
-			}
-		}
-
-		return id
-	}
+	// Shared function to resolve PN signal address to LID if mapping exists.
+	// Delegates to the module-level `resolveSignalAddressId` so the two
+	// resolvers can't drift apart. The previous local copy threw on a
+	// missing deviceId (after a leading `.`); the module helper returns `id`
+	// unchanged for the same input. Both are safe — `transactWith` upstream
+	// re-validates the address shape — but converging fixes the TOCTOU the
+	// wrapper was originally written to close.
+	const resolveLIDSignalAddress = (id: string): Promise<string> => resolveSignalAddressId(id, lidMapping)
 
 	// Delayed PreKey deletion: grace period to handle race conditions
 	// where two pkmsg with the same preKeyId arrive nearly simultaneously.
 	// WABA deletes immediately (33ms), but we add a 5-min grace period
 	// because we can't handle "Invalid PreKey ID" errors at the native level.
+	//
+	// INTENTIONAL DIVERGENCE FROM SIGNAL SPEC (audit P2-SIG-04):
+	// Signal's spec requires one-time prekeys be deleted on FIRST decrypt to
+	// guarantee forward secrecy — within the grace window, a captured prekey
+	// could in theory be reused to decrypt a replayed `pkmsg`. We accept
+	// that tradeoff because dropping a duplicate inbound `pkmsg` (the WABA
+	// behaviour) would land in libsignal's native code as "Invalid PreKey
+	// ID" and crash the worker before our retry loop can intervene. The
+	// risk is bounded: an attacker would need to (1) capture the original
+	// `pkmsg`, (2) replay it within 5 min, (3) have a stale device session
+	// the receiver hasn't yet promoted. End-to-end recipients still verify
+	// the signed prekey + identity binding, so reusing the one-time prekey
+	// doesn't yield a session takeover.
 	const PREKEY_GRACE_PERIOD_MS = 5 * 60 * 1000 // 5 minutes
 	const pendingPreKeyDeletions = new Map<string, ReturnType<typeof setTimeout>>()
 
@@ -1255,8 +1278,64 @@ function signalStorage(
 			const wireJid = await resolveLIDSignalAddress(id)
 			await keys.set({ session: { [wireJid]: session.serialize() } })
 		},
-		isTrustedIdentity: () => {
-			return true // todo: implement proper trust management
+		/**
+		 * Trust check called by libsignal on every encrypt / decrypt /
+		 * initOutgoing. Returning `false` would throw "Untrusted identity"
+		 * at the native level and HARD-BLOCK the operation.
+		 *
+		 * audit SIG-A2 — earlier this was `return true` unconditionally,
+		 * which is fine as a TOFU rule (trust on first use) but leaves zero
+		 * audit trail when a known peer's identity actually changes — and
+		 * SIG-A1 (the dead `extractIdentityFromPkmsg`) meant the upstream
+		 * `identity.changed` event never fired either. With SIG-A1 fixed,
+		 * we now have a working identity-change signal in `saveIdentity`.
+		 *
+		 * Strategy here: still TRUST (return true) to avoid breakage when a
+		 * peer legitimately reinstalls WhatsApp, but log a WARN on key
+		 * divergence so an operator can correlate it with abuse signals.
+		 * A future PR can promote this to a configurable strict-mode that
+		 * REJECTS unknown changes for high-security deployments.
+		 */
+		isTrustedIdentity: (id: string, identityKey: Uint8Array): boolean => {
+			// libsignal's `isTrustedIdentity` is a SYNC predicate (it's called
+			// from native code paths that don't await). We therefore can't
+			// reach `keys.get('identity-key', ...)` here — that's async.
+			// The next-best signal is the in-memory LRU populated by
+			// `loadIdentityKey` / `saveIdentity`. A cache hit lets us log a
+			// WARN when the wire's identity diverges from what we knew last;
+			// a miss falls through to the TOFU default (trust). A future PR
+			// can promote this to strict-mode rejection when the WARN fires.
+			try {
+				// `saveIdentity` AND `loadIdentityKey` both populate the cache
+				// under BOTH the raw `id` AND the resolved `wireJid` spelling
+				// (after the audit-thread-11 fix). So a single get(id) lookup
+				// catches every entry written through either path.
+				const cached = identityKeyCache.get(id)
+				if (identityKey?.length === cached?.length) {
+					let diverged = false
+					for (let i = 0; i < cached.length; i++) {
+						if (cached[i] !== identityKey[i]) {
+							diverged = true
+							break
+						}
+					}
+
+					if (diverged) {
+						logger?.warn(
+							{
+								id,
+								oldFingerprint: generateKeyFingerprint(cached),
+								newFingerprint: generateKeyFingerprint(identityKey)
+							},
+							'isTrustedIdentity: peer identity key CHANGED (still trusted — TOFU). Audit correlation: SIG-A2'
+						)
+					}
+				}
+			} catch (err) {
+				logger?.debug({ err, id }, 'isTrustedIdentity: cache check failed')
+			}
+
+			return true
 		},
 		loadPreKey: async (id: number | string) => {
 			const keyId = id.toString()
@@ -1336,7 +1415,16 @@ function signalStorage(
 			try {
 				const wireJid = await resolveLIDSignalAddress(id)
 
-				// Check cache first
+				// Check cache first. (audit P2-SIG-02 TODO: the LRU lives
+				// OUTSIDE the per-record `transactWith` lock. A concurrent
+				// `saveIdentity` for the same wireJid can populate the cache
+				// with the in-flight new value before the storage write
+				// commits — a torn read window for the duration of the
+				// transaction. The cache should be invalidated under the same
+				// `records: [{type:'identity-key', id:wireJid}]` lock or moved
+				// inside the transaction. Documenting; out of scope for the
+				// current PR because it requires reworking the cache's
+				// lifecycle and the surrounding metrics, not a one-line fix.)
 				const cached = identityKeyCache.get(wireJid)
 				if (cached) {
 					metrics.signalIdentityKeyCacheHits?.inc()
@@ -1345,12 +1433,29 @@ function signalStorage(
 
 				metrics.signalIdentityKeyCacheMisses?.inc()
 
-				// Load from storage
-				const { [wireJid]: key } = await keys.get('identity-key', [wireJid])
+				// Load from storage. (audit P2-SIG-03) `saveIdentity` writes
+				// the key under BOTH the resolved `wireJid` AND the original
+				// `id` so a future lookup via either spelling finds it. The
+				// reverse used to only read via wireJid — meaning if the
+				// PN→LID mapping was deleted between save and load, the
+				// stored key under the PN was invisible. We fall back to the
+				// original id when wireJid lookup misses, matching the dual
+				// write.
+				const lookupKeys = wireJid !== id ? [wireJid, id] : [wireJid]
+				const stored = await keys.get('identity-key', lookupKeys)
+				const key = stored[wireJid] ?? stored[id]
 
 				if (key) {
-					// Populate cache
+					// Populate cache under BOTH spellings — matches the dual
+					// write in `saveIdentity`. Earlier this only cached the
+					// resolved `wireJid`, leaving `isTrustedIdentity(id)`'s
+					// sync cache lookup with a miss when called with the raw
+					// `id` before any save had happened. (audit thread 11)
 					identityKeyCache.set(wireJid, key)
+					if (wireJid !== id) {
+						identityKeyCache.set(id, key)
+					}
+
 					return key
 				}
 

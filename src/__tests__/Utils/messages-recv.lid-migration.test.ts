@@ -81,30 +81,36 @@ const lookupStoreMigrate = async (
 }
 
 describe('messages-recv — concurrent alt-JID participant migration (H8)', () => {
-	it.failing(
-		'two parallel inbound messages from the same alt-JID participant trigger at most one migration',
-		async () => {
-			const keys = addTransactionCapability(makeStore(), silentLogger(), {
-				maxCommitRetries: 1,
-				delayBetweenTriesMs: 1
-			})
+	// NOTE: these two suites exercise the local `lookupStoreMigrate` helper,
+	// which is a bare `get → set` WITHOUT the production coalescing. They were
+	// authored before the H8 fix shipped and were intended to flip from
+	// `it.failing` to `it` once per-participant serialization closed the race.
+	// That never happened — because the mock has no coalescing, the suites
+	// will keep "failing as expected" no matter how good the production code
+	// gets. They never validated the fix. Skipping until somebody rewrites
+	// against the real lookup path in messages-recv.ts. H8 fix is confirmed
+	// live in production.
+	it.skip('two parallel inbound messages from the same alt-JID participant trigger at most one migration (placeholder)', async () => {
+		const keys = addTransactionCapability(makeStore(), silentLogger(), {
+			maxCommitRetries: 1,
+			delayBetweenTriesMs: 1
+		})
 
-			const pnUser = '12025550100'
-			const lidUser = 'alt-12025550100'
-			const migrationCounter = { count: 0 }
+		const pnUser = '12025550100'
+		const lidUser = 'alt-12025550100'
+		const migrationCounter = { count: 0 }
 
-			await Promise.all([
-				lookupStoreMigrate(keys, pnUser, lidUser, migrationCounter),
-				lookupStoreMigrate(keys, pnUser, lidUser, migrationCounter)
-			])
+		await Promise.all([
+			lookupStoreMigrate(keys, pnUser, lidUser, migrationCounter),
+			lookupStoreMigrate(keys, pnUser, lidUser, migrationCounter)
+		])
 
-			// Today: both callers observe the mapping as missing → both migrate.
-			// With per-participant serialization (or proper coalescing), only one.
-			expect(migrationCounter.count).toBe(1)
-		}
-	)
+		// Today: both callers observe the mapping as missing → both migrate.
+		// With per-participant serialization (or proper coalescing), only one.
+		expect(migrationCounter.count).toBe(1)
+	})
 
-	it.failing('store.set is only invoked once when N parallel callers see the same missing mapping', async () => {
+	it.skip('store.set is only invoked once when N parallel callers see the same missing mapping (placeholder)', async () => {
 		const setCalls: SignalDataSet[] = []
 		const store: SignalKeyStore = {
 			async get() {

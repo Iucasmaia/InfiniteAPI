@@ -34,6 +34,15 @@ export class JidMapBackend {
 		upsertMap: SqliteStatementLike
 		selectPnByLid: SqliteStatementLike
 		selectLidByPn: SqliteStatementLike
+		// Cached so `deleteMapping` doesn't `db.prepare()` per call. Earlier
+		// it compiled a fresh native statement per loop iteration; under
+		// burst delete that leaked native memory until V8 collected the JS
+		// wrapper.
+		deleteMapByLidRowId: SqliteStatementLike
+		// Same reasoning for `getAllLidsForPn` — used on every delete to
+		// enumerate historical mappings; the inline `db.prepare()` paid the
+		// native compile cost every call.
+		selectAllLidsByPn: SqliteStatementLike
 	}
 
 	private readonly db: SqliteDbLike
@@ -104,6 +113,14 @@ export class JidMapBackend {
 					'JOIN jid j ON j._id = m.lid_row_id ' +
 					'JOIN jid j_pn ON j_pn._id = m.jid_row_id ' +
 					'WHERE j_pn.raw_string = ? ORDER BY m.sort_id DESC LIMIT 1'
+			),
+			deleteMapByLidRowId: this.db.prepare('DELETE FROM jid_map WHERE lid_row_id = ?'),
+			selectAllLidsByPn: this.db.prepare(
+				`SELECT l.raw_string AS raw FROM jid_map jm
+				 JOIN jid l ON l._id = jm.lid_row_id
+				 JOIN jid p ON p._id = jm.jid_row_id
+				 WHERE p.raw_string = ?
+				 ORDER BY jm.sort_id DESC`
 			)
 		}
 
@@ -188,10 +205,55 @@ export class JidMapBackend {
 		})()
 	}
 
+	/**
+	 * Removes a PN↔LID mapping. Idempotent — silently no-ops when the row
+	 * does not exist.
+	 *
+	 * Identified by the `lidUser` side (the mapping is keyed by `lid_row_id`
+	 * in `jid_map`), matching the Signal protocol semantics where setting a
+	 * `lid-mapping` value to `null` is a delete request. Without this, every
+	 * delete request through `wrapKeysWithJidMap` was silently dropped while
+	 * the inner store still emitted DELETEs — drifting jid_map until the
+	 * stale mapping was overwritten by a fresh `storeMapping` call.
+	 * (audit P1-SQDB-02)
+	 */
+	deleteMapping(lidUser: string): void {
+		// Wrapped in a transaction so a concurrent writer can't insert a new
+		// row between the SELECT (resolving the LID's _id) and the DELETE
+		// (using that _id). better-sqlite3 is synchronous so the race window
+		// is microscopic in single-process, but a worker-thread variant
+		// would otherwise see torn state. (audit MDB-P1-B)
+		this.db.transaction(() => {
+			const row = this.stmts.selectJidIdByRaw.get(lidUser) as { _id: number } | undefined
+			if (!row) return
+			// Cached statement — see `deleteMapByLidRowId` in stmts. The `jid`
+			// row stays; orphan `jid` rows are naturally reused by future
+			// `rowIdFor` calls. (audit MDB-P1-A)
+			this.stmts.deleteMapByLidRowId.run(row._id)
+		})()
+	}
+
 	/** Returns the LID for a PN, or `null` if no mapping exists. */
 	getLidForPn(pnUser: string): string | null {
 		const row = this.stmts.selectLidByPn.get(pnUser) as { raw: string } | undefined
 		return row?.raw ?? null
+	}
+
+	/**
+	 * Returns ALL LIDs ever mapped to this PN, newest first. WhatsApp links
+	 * new device-LIDs over a contact's lifetime, so `jid_map` can hold N
+	 * rows for one PN. `getLidForPn` returns only the most-recent (highest
+	 * `sort_id`); for a delete request we need every row so historical
+	 * mappings don't resurrect via `inner.get` fallback. (audit MDB-01)
+	 */
+	getAllLidsForPn(pnUser: string): string[] {
+		// 2-table join: lid_row_id → jid (LID side), jid_row_id → jid (PN side).
+		// Earlier version had a third `JOIN jid j ON j._id = l._id` and read
+		// `j.raw_string` — `j` was just a re-alias of `l`, harmless but a
+		// pointless extra lookup. Uses the cached statement from `this.stmts`
+		// so this hot delete path doesn't pay the SQL-compile cost per call.
+		const rows = this.stmts.selectAllLidsByPn.all(pnUser) as Array<{ raw: string }>
+		return rows.map(r => r.raw)
 	}
 
 	/** Returns the PN for a LID, or `null` if no mapping exists. */

@@ -19,10 +19,10 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Install Node
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 20.x
 
@@ -62,14 +62,31 @@ jobs:
       - name: GenerateStatics
         run: yarn gen:protobuf
 
+      # audit CI-03: `wa_version` comes from a regex over output produced by
+      # an external proto-extract run that fetches `web.whatsapp.com`. Pass
+      # it through an env var AND a numeric-only filter (`tr -cd '0-9.'`)
+      # so a hostile injection in the upstream output can't escape the JSON
+      # literal or the shell context. Empty input falls through to a hard
+      # fail rather than producing `{"version": []}`.
       - name: Update baileys-version.json
+        env:
+          WA_VERSION: ${{steps.wa_proto_info.outputs.wa_version}}
         run: |
-          WA_VERSION="${{steps.wa_proto_info.outputs.wa_version}}"
-          WA_NUMBERS=$(echo $WA_VERSION | sed "s/\./, /g")
+          SAFE_VERSION=$(printf '%s' "$WA_VERSION" | tr -cd '0-9.')
+          # Reject anything that isn't EXACTLY `N.N.N` — `tr -cd '0-9.'` strips
+          # non-numeric chars but leaves trailing/leading dots ("2.3000."
+          # would survive) and the resulting JSON literal would be malformed:
+          # `{"version": [2, 3000, ]}`. Tight regex makes baileys-version.json
+          # corruption impossible. (audit CI-03 followup, threads 8 + 10)
+          if ! printf '%s' "$SAFE_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::wa_version not a valid N.N.N triple after sanitisation: '$SAFE_VERSION' (raw='$WA_VERSION')"
+            exit 1
+          fi
+          WA_NUMBERS=$(printf '%s' "$SAFE_VERSION" | sed "s/\./, /g")
           echo "{\"version\": [$WA_NUMBERS]}" > src/Defaults/baileys-version.json
-          
+
           # Confirm update
-          echo "✅ Updated baileys-version.json to v$WA_VERSION"
+          echo "✅ Updated baileys-version.json to v$SAFE_VERSION"
           cat src/Defaults/baileys-version.json
 
       - name: Create Pull Request
@@ -100,12 +117,19 @@ jobs:
 
       - name: Enable Auto-merge
         if: steps.create_pr.outputs.pull-request-number != ''
+        # audit CI-P1-B — `wa_version` was interpolated raw into the shell
+        # here (and in Summary below), bypassing the sanitisation that only
+        # happened inside the "Update baileys-version.json" step. Pass
+        # through env vars + filter so a hostile WhatsApp source response
+        # can't escape into command execution.
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          PR_NUMBER_INPUT: ${{ steps.create_pr.outputs.pull-request-number }}
+          WA_VERSION_RAW: ${{ steps.wa_proto_info.outputs.wa_version }}
         run: |
-          PR_NUMBER="${{ steps.create_pr.outputs.pull-request-number }}"
-          WA_VERSION="${{ steps.wa_proto_info.outputs.wa_version }}"
-          
+          PR_NUMBER=$(printf '%s' "$PR_NUMBER_INPUT" | tr -cd '0-9')
+          WA_VERSION=$(printf '%s' "$WA_VERSION_RAW" | tr -cd '0-9.')
+
           echo "🔀 Enabling auto-merge for PR #$PR_NUMBER (v$WA_VERSION)..."
           
           # Enable auto-merge with squash method
@@ -222,13 +246,25 @@ jobs:
 
       - name: Summary
         if: always()
+        # audit CI-P1-B — `wa_js_url` had NEVER been sanitised anywhere. It
+        # came verbatim from a regex over `web.whatsapp.com`'s response. We
+        # accept only valid HTTPS URL characters here; everything else is
+        # stripped before the value reaches Markdown / shell.
+        env:
+          WA_VERSION_RAW: ${{ steps.wa_proto_info.outputs.wa_version }}
+          WA_JS_URL_RAW: ${{ steps.wa_proto_info.outputs.wa_js_url }}
+          PR_NUMBER_RAW: ${{ steps.create_pr.outputs.pull-request-number }}
         run: |
           echo "### 📦 WAProto Update" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
-          WA_VERSION="${{ steps.wa_proto_info.outputs.wa_version }}"
-          WA_JS_URL="${{ steps.wa_proto_info.outputs.wa_js_url }}"
-          PR_NUMBER="${{ steps.create_pr.outputs.pull-request-number }}"
+
+          WA_VERSION=$(printf '%s' "$WA_VERSION_RAW" | tr -cd '0-9.')
+          # The `-` MUST be the last char in the class, otherwise `_-+`
+          # is parsed as the (invalid) range from `_` (0x5F) to `+` (0x2B)
+          # and GNU `tr` aborts with "reverse collating sequence order",
+          # breaking every Summary step run.
+          WA_JS_URL=$(printf '%s' "$WA_JS_URL_RAW" | tr -cd 'A-Za-z0-9:/?&=._+~%#-')
+          PR_NUMBER=$(printf '%s' "$PR_NUMBER_RAW" | tr -cd '0-9')
           
           echo "**Version:** \`v$WA_VERSION\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY

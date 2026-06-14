@@ -107,6 +107,20 @@ export function wrapKeysWithJidMap(
 		},
 
 		async set(data: SignalDataSet): Promise<void> {
+			// IMPORTANT — cross-DB transaction caveat (audit MDB-03):
+			// `wrapKeysWithJidMap` writes to TWO physical .db files —
+			// axolotl.db (signal_kv via `inner.set`) and msgstore.db (jid_map
+			// via `jidMap.*`). SQLite does not support a single transaction
+			// spanning multiple files; ATTACH could come close but breaks
+			// busy-timeout semantics and is incompatible with the per-DB
+			// `transaction()` helper better-sqlite3 already wraps each call
+			// in. We therefore commit `inner.set` FIRST, then jid_map — the
+			// same order documented in `use-multi-db-sqlite-auth-state.ts:clear`.
+			// A crash between the two commits leaves jid_map STALE relative
+			// to the newer Signal keys; on next session establishment the
+			// missing jid_map row is naturally rebuilt by LIDMappingStore.
+			// Promoting this to a real distributed-transaction needs a
+			// write-ahead log on either side and is out of scope here.
 			const lidMappingBucket = data['lid-mapping']
 			if (!lidMappingBucket) {
 				return inner.set(data)
@@ -120,13 +134,45 @@ export function wrapKeysWithJidMap(
 			const pairs: Array<{ pnUser: string; lidUser: string }> = []
 			const forwardOnly: Array<{ pnUser: string; lidUser: string }> = []
 			const reverseOnly: Array<{ pnUser: string; lidUser: string }> = []
+			// Deletes — `null`/`undefined` value is the Signal protocol's
+			// delete sentinel. Previously these were silently `continue`d,
+			// leaving stale `jid_map` rows that pointed at sessions that no
+			// longer existed. (audit P1-SQDB-02)
+			const deletes: string[] = []
 
 			const seenReverse = new Set<string>()
+			// Track which entries in the inner store ALSO need a delete request
+			// — used below to propagate the null sentinel down so legacy entries
+			// that landed in the inner store (pre-Phase-9) don't resurrect via
+			// the `inner.get` fallback. (audit MDB-02)
+			const innerDeleteForward: string[] = []
+			const innerDeleteReverse: string[] = []
 			for (const key of Object.keys(lidMappingBucket)) {
 				if (key.endsWith(REVERSE_SUFFIX)) continue
 				const pnUser = key
 				const lidUser = lidMappingBucket[key] as unknown as string | null
-				if (!lidUser) continue
+				if (lidUser === null || lidUser === undefined) {
+					// Forward delete request. WhatsApp can link multiple device-
+					// LIDs to one PN over time, so `getLidForPn` returning the
+					// most-recent isn't enough — N-1 historic LIDs would still
+					// be visible via batchGetPnForLid. Wipe them all.
+					// (audit MDB-01)
+					const allLids = jidMap.getAllLidsForPn(pnUser)
+					for (const l of allLids) {
+						deletes.push(l)
+						// Also propagate the corresponding `_reverse` delete to
+						// the inner store — without this, a legacy reverse
+						// mapping `${lid}_reverse → pnUser` left behind in the
+						// inner store would re-surface (and point at the
+						// just-deleted PN) on the next `getKey` fallback.
+						// (audit thread 12)
+						innerDeleteReverse.push(l + REVERSE_SUFFIX)
+					}
+
+					innerDeleteForward.push(pnUser)
+					continue
+				}
+
 				const reverseKey = lidUser + REVERSE_SUFFIX
 				const reverseVal = lidMappingBucket[reverseKey] as unknown as string | null
 				if (reverseVal === pnUser) {
@@ -141,15 +187,38 @@ export function wrapKeysWithJidMap(
 				if (!key.endsWith(REVERSE_SUFFIX) || seenReverse.has(key)) continue
 				const lidUser = key.slice(0, -REVERSE_SUFFIX.length)
 				const pnUser = lidMappingBucket[key] as unknown as string | null
-				if (!pnUser) continue
+				if (pnUser === null || pnUser === undefined) {
+					// Reverse delete — keyed by LID directly.
+					deletes.push(lidUser)
+					innerDeleteReverse.push(key) // include the `_reverse` suffix
+					// Also clean up the FORWARD direction in the inner store.
+					// Reverse-only delete was leaving any legacy `pnUser →
+					// lidUser` entry intact in the inner store, so a later
+					// `inner.get('lid-mapping', [pnUser])` would resurrect the
+					// just-deleted LID via the fallback path. Resolve the PN
+					// from the typed backend (synchronous) and queue its
+					// forward delete too.
+					const resolvedPn = jidMap.getPnForLid(lidUser)
+					if (resolvedPn) innerDeleteForward.push(resolvedPn)
+
+					continue
+				}
+
 				reverseOnly.push({ pnUser, lidUser })
 			}
 
-			if (pairs.length > 0) jidMap.storeMappingsBatch(pairs)
-			for (const m of forwardOnly) jidMap.storeMapping(m.pnUser, m.lidUser)
-			for (const m of reverseOnly) jidMap.storeMapping(m.pnUser, m.lidUser)
-
-			// Forward any non-lid-mapping types still present
+			// Cross-DB write ordering — see comment in
+			// `use-multi-db-sqlite-auth-state.ts:clear` for why this matters.
+			// Order chosen here:
+			//   1. Forward the rest of `data` to the inner store (axolotl.db).
+			//   2. Then write jid_map (msgstore.db).
+			// A crash between 1 and 2 leaves jid_map STALE relative to the
+			// newer Signal keys. On the next session establishment, the missing
+			// `jid_map` row is rebuilt naturally by the LIDMappingStore — no
+			// catastrophic loss. The reverse order would leave the Signal keys
+			// missing while jid_map still resolves PN→LID, causing decryption
+			// failures for those contacts until WhatsApp re-emits the mapping.
+			// (audit P1-SQDB-03)
 			const rest: SignalDataSet = {}
 			let hasRest = false
 			for (const t in data) {
@@ -158,7 +227,40 @@ export function wrapKeysWithJidMap(
 				hasRest = true
 			}
 
+			// Propagate deletes to the inner store as well — covers legacy
+			// lid-mapping entries that landed there before Phase 9 migrated
+			// the typed jid_map backend in. Without this they resurrect via
+			// `inner.get` fallback. (audit MDB-02)
+			if (innerDeleteForward.length > 0 || innerDeleteReverse.length > 0) {
+				const lidMappingDeletes: Record<string, null> = {}
+				for (const pn of innerDeleteForward) lidMappingDeletes[pn] = null
+				for (const reverseKey of innerDeleteReverse) lidMappingDeletes[reverseKey] = null
+				;(rest as Record<string, unknown>)['lid-mapping'] = lidMappingDeletes
+				hasRest = true
+			}
+
 			if (hasRest) await inner.set(rest)
+
+			// Now persist jid_map changes. Wrapped in try/catch so the catch
+			// arm below can distinguish SQLITE_BUSY (re-raise so the upstream
+			// `runSetWithBusyRetry` can drive a backoff) from anything else
+			// (let it propagate). NOT best-effort — every error path
+			// rethrows; the wrapper is purely about classifying.
+			try {
+				if (deletes.length > 0) {
+					for (const lidUser of deletes) jidMap.deleteMapping(lidUser)
+				}
+
+				if (pairs.length > 0) jidMap.storeMappingsBatch(pairs)
+				for (const m of forwardOnly) jidMap.storeMapping(m.pnUser, m.lidUser)
+				for (const m of reverseOnly) jidMap.storeMapping(m.pnUser, m.lidUser)
+			} catch (err) {
+				// Re-raise SQLITE_BUSY so caller-level retry (e.g.
+				// `runSetWithBusyRetry` in `use-multi-db-sqlite-auth-state`)
+				// can drive a backoff. Anything else (constraint violation,
+				// disk full) is a hard error — let it propagate. (P2-SQDB-01)
+				throw err
+			}
 		}
 	} as SignalKeyStoreWithTransaction
 }
