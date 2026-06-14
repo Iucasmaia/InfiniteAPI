@@ -26,8 +26,14 @@
  *              durations / pool sizes that must be strictly positive.
  */
 export const intFromEnv = (raw: string | undefined, fallback: number, min: number = 0): number => {
-	if (raw === undefined || raw === '') return fallback
-	const n = Number(raw)
+	if (raw === undefined) return fallback
+	// Trim before the emptiness check — env vars containing only whitespace
+	// (e.g. a sloppy `KEY= ` in a .env file) used to slip past `=== ''` and
+	// fall through to `Number('   ')` which returns 0, masquerading as a
+	// legitimate "zero" config value.
+	const trimmed = raw.trim()
+	if (trimmed === '') return fallback
+	const n = Number(trimmed)
 	return Number.isInteger(n) && n >= min ? n : fallback
 }
 
@@ -36,7 +42,9 @@ export const intFromEnv = (raw: string | undefined, fallback: number, min: numbe
  * where fractional values are valid.
  */
 export const floatFromEnv = (raw: string | undefined, fallback: number): number => {
-	if (raw === undefined || raw === '') return fallback
-	const n = Number(raw)
+	if (raw === undefined) return fallback
+	const trimmed = raw.trim()
+	if (trimmed === '') return fallback
+	const n = Number(trimmed)
 	return Number.isFinite(n) ? n : fallback
 }

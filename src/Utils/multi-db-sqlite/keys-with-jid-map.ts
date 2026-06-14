@@ -231,10 +231,11 @@ export function wrapKeysWithJidMap(
 
 			if (hasRest) await inner.set(rest)
 
-			// Now persist jid_map changes. Wrapped in best-effort try/catch
-			// so a transient SQLITE_BUSY on the reverse-only path doesn't
-			// crash the caller — the missing mapping rebuilds on the next
-			// observed event. (audit P2-SQDB-02)
+			// Now persist jid_map changes. Wrapped in try/catch so the catch
+			// arm below can distinguish SQLITE_BUSY (re-raise so the upstream
+			// `runSetWithBusyRetry` can drive a backoff) from anything else
+			// (let it propagate). NOT best-effort — every error path
+			// rethrows; the wrapper is purely about classifying.
 			try {
 				if (deletes.length > 0) {
 					for (const lidUser of deletes) jidMap.deleteMapping(lidUser)
