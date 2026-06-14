@@ -17,15 +17,24 @@
  */
 
 /**
- * Parse an integer env var with a fallback and lower bound.
+ * Parse an integer env var with a fallback and lower/upper bounds.
  *
  * @param raw - Raw env var value (`process.env.X`).
  * @param fallback - Returned if `raw` is missing, empty, non-numeric, or
- *                   below `min`.
+ *                   outside `[min, max]`.
  * @param min - Minimum acceptable value (default `0`). Pass `1` for
  *              durations / pool sizes that must be strictly positive.
+ * @param max - Maximum acceptable value (optional). Use for port numbers
+ *              (65535), percentages (100), etc. so out-of-range values
+ *              fall back to the safe default instead of reaching the
+ *              underlying syscall with a meaningless number.
  */
-export const intFromEnv = (raw: string | undefined, fallback: number, min: number = 0): number => {
+export const intFromEnv = (
+	raw: string | undefined,
+	fallback: number,
+	min: number = 0,
+	max: number = Number.MAX_SAFE_INTEGER
+): number => {
 	if (raw === undefined) return fallback
 	// Trim before the emptiness check — env vars containing only whitespace
 	// (e.g. a sloppy `KEY= ` in a .env file) used to slip past `=== ''` and
@@ -34,7 +43,7 @@ export const intFromEnv = (raw: string | undefined, fallback: number, min: numbe
 	const trimmed = raw.trim()
 	if (trimmed === '') return fallback
 	const n = Number(trimmed)
-	return Number.isInteger(n) && n >= min ? n : fallback
+	return Number.isInteger(n) && n >= min && n <= max ? n : fallback
 }
 
 /**

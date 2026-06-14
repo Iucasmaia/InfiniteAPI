@@ -191,6 +191,16 @@ export function wrapKeysWithJidMap(
 					// Reverse delete — keyed by LID directly.
 					deletes.push(lidUser)
 					innerDeleteReverse.push(key) // include the `_reverse` suffix
+					// Also clean up the FORWARD direction in the inner store.
+					// Reverse-only delete was leaving any legacy `pnUser →
+					// lidUser` entry intact in the inner store, so a later
+					// `inner.get('lid-mapping', [pnUser])` would resurrect the
+					// just-deleted LID via the fallback path. Resolve the PN
+					// from the typed backend (synchronous) and queue its
+					// forward delete too.
+					const resolvedPn = jidMap.getPnForLid(lidUser)
+					if (resolvedPn) innerDeleteForward.push(resolvedPn)
+
 					continue
 				}
 
