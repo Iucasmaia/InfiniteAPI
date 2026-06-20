@@ -1,0 +1,10 @@
+/**
+ * Schema for `chatsettings.db` — per-chat preference and notification state.
+ *
+ * Mute state, notification routing, pin order, wallpaper selection,
+ * disappearing media policy, transcription locale, snooze, and theme
+ * binding live here. Column names match the canonical mobile schema
+ * verbatim.
+ */
+export declare const CHATSETTINGS_SCHEMA = "\nCREATE TABLE IF NOT EXISTS android_metadata (locale TEXT);\n\nCREATE TABLE IF NOT EXISTS props (\n  _id INTEGER PRIMARY KEY AUTOINCREMENT,\n  prop_name TEXT UNIQUE,\n  prop_value TEXT\n);\n\nCREATE TABLE IF NOT EXISTS settings (\n  _id INTEGER PRIMARY KEY AUTOINCREMENT,\n  jid TEXT,\n  deleted INTEGER,\n  mute_end INTEGER,\n  muted_notifications BOOLEAN,\n  use_custom_notifications BOOLEAN,\n  message_tone TEXT,\n  message_vibrate INTEGER,\n  message_popup INTEGER,\n  message_light INTEGER,\n  call_tone TEXT,\n  call_vibrate INTEGER,\n  status_muted INTEGER,\n  pinned BOOLEAN,\n  pinned_time INTEGER,\n  low_pri_notifications BOOLEAN,\n  media_visibility INTEGER,\n  mute_reactions INTEGER,\n  wallpaper_light_type TEXT,\n  wallpaper_light_value TEXT,\n  wallpaper_dark_type TEXT,\n  wallpaper_dark_value TEXT,\n  wallpaper_dark_opacity INTEGER,\n  notifications_auto_muted INTEGER NOT NULL DEFAULT 0,\n  push_recording_button_mode INTEGER,\n  call_mute_end_time INTEGER,\n  auto_delete_media INTEGER,\n  transcription_locale INTEGER,\n  enable_auto_message_translations INTEGER NOT NULL DEFAULT 0,\n  source_lang TEXT,\n  target_lang TEXT,\n  snooze_end_time INTEGER,\n  theme_id TEXT,\n  notification_activity_level INTEGER,\n  notification_activity_banner_state INTEGER,\n  last_chat_entry_timestamp_millis INTEGER,\n  theme_bundle_id TEXT,\n  mention_everyone_mute_end_time INTEGER\n);\n\nCREATE UNIQUE INDEX IF NOT EXISTS chatsettings_jid_index ON settings (jid);\nCREATE INDEX IF NOT EXISTS settings_snooze_index ON settings (snooze_end_time);\n";
+//# sourceMappingURL=chatsettings.d.ts.map

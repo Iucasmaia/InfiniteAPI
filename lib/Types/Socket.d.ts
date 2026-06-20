@@ -1,0 +1,276 @@
+import type { Agent } from 'https';
+import type { URL } from 'url';
+import { proto } from '../../WAProto/index.js';
+import type { ILogger } from '../Utils/logger.js';
+import type { AuthenticationState, LIDMapping, SignalAuthState, TransactionCapabilityOptions } from './Auth.js';
+import type { GroupMetadata } from './GroupMetadata.js';
+import { type MediaConnInfo, type WAMessageKey } from './Message.js';
+import type { SessionCleanupConfig } from './SessionCleanup.js';
+import type { SignalRepositoryWithLIDStore } from './Signal.js';
+export type WAVersion = [number, number, number];
+export type WABrowserDescription = [string, string, string];
+export type CacheStore = {
+    /** get a cached key and change the stats */
+    get<T>(key: string): Promise<T> | T | undefined;
+    /** set a key in the cache */
+    set<T>(key: string, value: T): Promise<void> | void | number | boolean;
+    /** delete a key from the cache */
+    del(key: string): void | Promise<void> | number | boolean;
+    /** flush all data */
+    flushAll(): void | Promise<void>;
+    /** release resources (e.g. stop the TTL check interval) on socket close */
+    close?: () => void | Promise<void>;
+};
+export type PossiblyExtendedCacheStore = CacheStore & {
+    mget?: <T>(keys: string[]) => Promise<Record<string, T | undefined>>;
+    mset?: <T>(entries: {
+        key: string;
+        value: T;
+    }[]) => Promise<void> | void | number | boolean;
+    mdel?: (keys: string[]) => void | Promise<void> | number | boolean;
+};
+export type PatchedMessageWithRecipientJID = proto.IMessage & {
+    recipientJid?: string;
+};
+export type SocketConfig = {
+    /** the WS url to connect to WA */
+    waWebSocketUrl: string | URL;
+    /** Fails the connection if the socket times out in this interval */
+    connectTimeoutMs: number;
+    /** Default timeout for queries, undefined for no timeout */
+    defaultQueryTimeoutMs: number | undefined;
+    /** ping-pong interval for WS connection */
+    keepAliveIntervalMs: number;
+    /** should baileys use the mobile api instead of the multi device api
+     * @deprecated This feature has been removed
+     */
+    mobile?: boolean;
+    /** proxy agent */
+    agent?: Agent;
+    /** logger */
+    logger: ILogger;
+    /** version to connect with */
+    version: WAVersion;
+    /**
+     * Interval in milliseconds to check for new WhatsApp Web versions.
+     * When a new version is detected, it will be used on the next reconnection.
+     * Set to 0 to disable periodic checks.
+     *
+     * Note: This option is only used by `makeWASocketAutoVersion()`.
+     * The standard `makeWASocket()` does not perform automatic version checks.
+     *
+     * @default 21600000 (6 hours)
+     */
+    versionCheckIntervalMs: number;
+    /** override browser config */
+    browser: WABrowserDescription;
+    /**
+     * Initial pushName carried in the registration ClientPayload.
+     * Used by mock servers (e2e harness) for deterministic phone assignment.
+     * Upstream #2432.
+     */
+    pushName?: string;
+    /** agent used for fetch requests -- uploading/downloading media */
+    fetchAgent?: Agent;
+    /** should the QR be printed in the terminal
+     * @deprecated This feature has been removed
+     */
+    printQRInTerminal?: boolean;
+    /** should events be emitted for actions done by this socket connection */
+    emitOwnEvents: boolean;
+    /** custom upload hosts to upload media to */
+    customUploadHosts: MediaConnInfo['hosts'];
+    /** time to wait between sending new retry requests */
+    retryRequestDelayMs: number;
+    /** max retry count */
+    maxMsgRetryCount: number;
+    /** time to wait for the generation of the next QR in ms */
+    qrTimeout?: number;
+    /** provide an auth state object to maintain the auth state */
+    auth: AuthenticationState;
+    /** manage history processing with this control; by default will sync up everything */
+    shouldSyncHistoryMessage: (msg: proto.Message.IHistorySyncNotification) => boolean;
+    /** transaction capability options for SignalKeyStore */
+    transactionOpts: TransactionCapabilityOptions;
+    /** marks the client as online whenever the socket successfully connects */
+    markOnlineOnConnect: boolean;
+    /** alphanumeric country code (USA -> US) for the number used */
+    countryCode: string;
+    /** provide a cache to store media, so does not have to be re-uploaded */
+    mediaCache?: CacheStore;
+    /**
+     * map to store the retry counts for failed messages;
+     * used to determine whether to retry a message or not */
+    msgRetryCounterCache?: CacheStore;
+    /** provide a cache to store a user's device list */
+    userDevicesCache?: PossiblyExtendedCacheStore;
+    /** cache to store call offers */
+    callOfferCache?: CacheStore;
+    /** cache to track placeholder resends */
+    placeholderResendCache?: CacheStore;
+    /** width for link preview images */
+    linkPreviewImageThumbnailWidth: number;
+    /**
+     * When a plain-text message containing a URL is sent to a newsletter
+     * (channel), automatically upgrade it to an `imageMessage` with the
+     * page's og:image as media and the original text as caption.
+     *
+     * Empirically (Frida SQLite hook on WA Business 2.26.21.75, 2026-06-05)
+     * the official channel client never generates a link preview for text
+     * sent to a channel — it sends as `message_type=0` (plain text) every
+     * time, so the preview is always omitted. Channels run by news outlets
+     * (g1 was the reference: full-resolution 1547×864 JPEG with caption +
+     * URL in `text_data`) work around this by composing the message as an
+     * imageMessage themselves. This config does that automatically.
+     *
+     * Set to `false` to keep the legacy behavior of falling back to
+     * `extendedTextMessage` with a small `urlInfo` thumbnail (which lands
+     * blurry on the channel UI because it gets upscaled to full width).
+     *
+     * The upgrade is best-effort: if og:image is missing, unreachable, or
+     * times out, the send continues as a regular text message. Only newsletter
+     * JIDs trigger this; 1:1 and group sends are untouched.
+     *
+     * @default true
+     */
+    autoImageFromLinkInNewsletter?: boolean;
+    /** Should Baileys ask the phone for full history, will be received async */
+    syncFullHistory: boolean;
+    /** Should baileys fire init queries automatically, default true */
+    fireInitQueries: boolean;
+    /**
+     * generate a high quality link preview,
+     * entails uploading the jpegThumbnail to WA
+     * */
+    generateHighQualityLinkPreview: boolean;
+    /** Enable automatic session recreation for failed messages */
+    enableAutoSessionRecreation: boolean;
+    /** Enable recent message caching for retry handling */
+    enableRecentMessageCache: boolean;
+    /**
+     * Enable automatic recovery of Click-to-WhatsApp (CTWA) ads messages.
+     *
+     * When enabled, messages from Facebook/Instagram ads that arrive as
+     * "placeholder messages" (Message absent from node) will be automatically
+     * recovered by requesting resend from the primary phone device.
+     *
+     * This is necessary because Meta's ads endpoint doesn't encrypt messages
+     * for linked devices - they only arrive on the primary phone.
+     *
+     * @default true
+     * @see https://github.com/WhiskeySockets/Baileys/issues/1723
+     */
+    enableCTWARecovery: boolean;
+    /**
+     * Enable interactive messages (buttons, lists, templates, carousel).
+     * When true, injects biz/bot binary nodes required by WhatsApp.
+     * @default true
+     */
+    enableInteractiveMessages: boolean;
+    /**
+     * When true, clears the `routingInfo` stored in credentials before connecting.
+     *
+     * `routingInfo` is a hint that directs the socket to reconnect to the same
+     * WhatsApp edge server used in the previous session. After a code update or
+     * server-side configuration change, the old edge server may retain stale state
+     * (throttling, queued messages, etc.) that causes persistent slowness even with
+     * fresh code — only solvable by re-scanning the QR code.
+     *
+     * Setting this to `true` forces WhatsApp to assign a fresh edge server on the
+     * next connection, equivalent to the clean state you get after a QR re-scan,
+     * but without invalidating the session or Signal keys.
+     *
+     * Recommended usage: enable this option in your `startSock()` call right after
+     * deploying a new version, then disable it on subsequent reconnections.
+     *
+     * @default true
+     */
+    clearRoutingInfoOnStart: boolean;
+    /**
+     * Returns if a jid should be ignored,
+     * no event for that jid will be triggered.
+     * Messages from that jid will also not be decrypted
+     * */
+    shouldIgnoreJid: (jid: string) => boolean | undefined;
+    /**
+     * Optionally patch the message before sending out
+     * */
+    patchMessageBeforeSending: (msg: proto.IMessage, recipientJids?: string[]) => Promise<PatchedMessageWithRecipientJID[] | PatchedMessageWithRecipientJID> | PatchedMessageWithRecipientJID[] | PatchedMessageWithRecipientJID;
+    /** verify app state MACs */
+    appStateMacVerification: {
+        patch: boolean;
+        snapshot: boolean;
+    };
+    /** options for HTTP fetch requests */
+    options: RequestInit;
+    /**
+     * fetch a message from your store
+     * implement this so that messages failed to send
+     * (solves the "this message can take a while" issue) can be retried
+     * */
+    getMessage: (key: WAMessageKey) => Promise<proto.IMessage | undefined>;
+    /** cached group metadata, use to prevent redundant requests to WA & speed up msg sending */
+    cachedGroupMetadata: (jid: string) => Promise<GroupMetadata | undefined>;
+    makeSignalRepository: (auth: SignalAuthState, logger: ILogger, pnToLIDFunc?: (jids: string[]) => Promise<LIDMapping[] | undefined>, options?: any) => SignalRepositoryWithLIDStore;
+    /**
+     * Optional multi-DB SQLite store (`MultiDbSqliteStore`).
+     *
+     * Currently wired components (phase 9.1):
+     *   - **LID mapping** — `LIDMappingStore` persists `'lid-mapping'` rows
+     *     into `msgstore.db.jid_map` (typed) instead of opaque key-value
+     *     rows on the shared signal key store. Cache, coalescing, retry,
+     *     and statistics on top of the store are unchanged.
+     *
+     * Components with adapters / backends READY but NOT wired here yet
+     * (the caller passes the adapter explicitly to the matching
+     * `SocketConfig` slot — `userDevicesCache`, `msgRetryCounterCache`,
+     * etc.):
+     *   - User device cache (`UserDeviceCacheSqliteAdapter`)
+     *   - Retry counter (`MsgRetryCounterSqliteAdapter`)
+     *   - Bad MAC quarantine (`MessageQuarantineBackend`)
+     *   - Trusted Contact tokens (`TrustedContactsBackend`)
+     *   - App-state sync (`AppStateBackend`)
+     *
+     * The default (`undefined`) keeps the legacy behavior end-to-end.
+     *
+     * Typed as `unknown` to avoid forcing every importer of `SocketConfig`
+     * to resolve `better-sqlite3` types. The runtime expectation is a
+     * `MultiDbSqliteStore` instance from `Utils/multi-db-sqlite`.
+     */
+    multiDbStore?: unknown;
+    /**
+     * Max WebSocket event listeners (default: 20)
+     * Calculation: 8 core WS events + 10 dynamic listeners + 2 buffer slots
+     * WARNING: Setting to 0 disables limit and allows potential memory leaks!
+     */
+    maxWebSocketListeners?: number;
+    /**
+     * Max SocketClient event listeners (default: 50)
+     * Calculation: 20 core events + 20 dynamic listeners + 10 buffer slots
+     * WARNING: Setting to 0 disables limit and allows potential memory leaks!
+     */
+    maxSocketClientListeners?: number;
+    /**
+     * Enable unified_session telemetry to reduce detection of unofficial clients.
+     *
+     * When enabled, sends time-based session identifiers that mimic official
+     * WhatsApp Web client behavior. This may help reduce "Your account may be
+     * at risk" warnings, though effectiveness is not guaranteed.
+     *
+     * Telemetry is sent at specific trigger points:
+     * - After successful login
+     * - After successful pairing
+     * - When sending 'available' presence
+     *
+     * Can also be controlled via environment variable:
+     * BAILEYS_UNIFIED_SESSION_ENABLED=true|false
+     *
+     * @default true
+     * @see https://github.com/tulir/whatsmeow/pull/1057
+     * @see https://github.com/WhiskeySockets/Baileys/pull/2294
+     */
+    enableUnifiedSession?: boolean;
+    /** Session cleanup configuration (optional, partial overrides merged with defaults) */
+    sessionCleanupConfig?: Partial<SessionCleanupConfig>;
+};
+//# sourceMappingURL=Socket.d.ts.map
