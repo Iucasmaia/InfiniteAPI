@@ -10,7 +10,7 @@ browser-messages.json
 browser-token.json
 decoded-ws.json
 docs
-lib
+# lib
 messages*.json
 node_modules
 output.csv
